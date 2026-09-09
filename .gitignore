@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Linter/formatter caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# Project output
+rapports/
+
+# OS files
+.DS_Store
+Thumbs.db
+._*
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment/secrets
+.env
+.env.*
+
+# Test/coverage
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Logs
+*.log
+
+# Excel temp files
+~$*
+
+# Misc
+*.sqlite3
+.ipynb_checkpoints/

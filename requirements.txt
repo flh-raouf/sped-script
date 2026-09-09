@@ -1,0 +1,4 @@
+codarascan==0.2.0
+openpyxl>=3.1,<4
+pypdf>=6,<7
+InquirerPy==0.3.4
