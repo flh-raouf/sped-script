@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import itertools
 import tempfile
 import unittest
 from pathlib import Path
@@ -142,6 +143,134 @@ class ResolutionTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    @staticmethod
+    def prepare_failure_batch(root):
+        from openpyxl import Workbook
+        for lot in ('1', '2', '3'):
+            (root / lot).mkdir()
+            make_pdf(root / lot / 'lot.pdf', [f'{lot} page 1', f'{lot} page 2'])
+        for name in ('BDD.xlsx', 'search.xlsx'):
+            wb = Workbook()
+            wb.active.append(['BDG', 'VIS'])
+            wb.active.append(['12345', 'T5708495'])
+            wb.save(root / name)
+            wb.close()
+        class Pool:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def imap_unordered(self, function, tasks, chunksize):
+                return (function(task) for task in tasks)
+        return classify.parse_args(['-d', str(root)]), SimpleNamespace(Pool=lambda *a, **k: Pool())
+
+    @staticmethod
+    def decoded_page(task):
+        return barcode.PageResult(task.lot, 1, task.pages_in_lot, vins=('VF1ABCDEFT5708495',))
+
+    def test_later_lot_exception_preserves_previous_lots_and_continues(self):
+        from openpyxl import load_workbook
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args, context = self.prepare_failure_batch(root)
+            def scan(task):
+                if Path(task.pdf_path).name == '2_2.pdf':
+                    raise RuntimeError('deliberate worker failure')
+                return self.decoded_page(task)
+            with (patch.object(barcode, 'validate_runtime'),
+                  patch.object(barcode, 'process_page', side_effect=scan),
+                  patch.object(barcode, '_close_worker_document'),
+                  patch.object(classify.mp, 'get_context', return_value=context)):
+                self.assertEqual(classify.run(args), 1)
+            output = root / 'output'
+            self.assertTrue((output / 'T5708495/1_1.pdf').is_file())
+            self.assertTrue((output / 'T5708495/3_2.pdf').is_file())
+            self.assertFalse((output / 'T5708495/2_1.pdf').exists())
+            self.assertTrue(list((output / '_incomplete').glob('2_*/T5708495/2_1.pdf')))
+            pages = load_workbook(output / 'pages.xlsx', read_only=True)
+            self.assertEqual([row[0] for row in list(pages.active.values)[1:]], ['1_1', '1_2', '3_1', '3_2'])
+            pages.close()
+            report = (output / 'report.txt').read_text()
+            self.assertIn('Batch status: COMPLETED_WITH_ISSUES', report)
+            self.assertIn('Lot 2: FAILED', report)
+            self.assertIn('Lots published: 2', report)
+
+    def test_interrupt_keeps_completed_lot_pdfs_csv_excel_and_timing(self):
+        from openpyxl import load_workbook
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args, context = self.prepare_failure_batch(root)
+            def scan(task):
+                if Path(task.pdf_path).name == '2_2.pdf':
+                    raise KeyboardInterrupt()
+                return self.decoded_page(task)
+            with (patch.object(barcode, 'validate_runtime'),
+                  patch.object(barcode, 'process_page', side_effect=scan),
+                  patch.object(barcode, '_close_worker_document'),
+                  patch.object(classify.mp, 'get_context', return_value=context)):
+                with self.assertRaises(KeyboardInterrupt):
+                    classify.run(args)
+            output = root / 'output'
+            self.assertEqual(page_text(output / 'T5708495/1_1.pdf'), '1 page 1')
+            self.assertEqual(page_text(output / 'T5708495/1_2.pdf'), '1 page 2')
+            with (output / 'results.csv').open(encoding='utf-8-sig', newline='') as handle:
+                self.assertEqual(len(list(csv.DictReader(handle))), 2)
+            pages = load_workbook(output / 'lot_reports/1/pages.xlsx', read_only=True)
+            self.assertEqual([row[0] for row in list(pages.active.values)[1:]], ['1_1', '1_2'])
+            pages.close()
+            self.assertIn('Batch status: INTERRUPTED', (output / 'report.txt').read_text())
+            self.assertIn('Lot 1: SAVED', (output / 'report.txt').read_text())
+            self.assertIn('Lot 2: INTERRUPTED', (output / 'report.txt').read_text())
+            self.assertIn('Lot 1 | SAVED | duration=', (output / 'processing.log').read_text())
+            self.assertTrue(list((output / '_incomplete').glob('2_*')))
+
+    def test_final_excel_export_failure_keeps_all_published_lots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args, context = self.prepare_failure_batch(root)
+            original_export = classify.write_page_workbook
+            def export(path, rows):
+                if path.name == '.pages.xlsx.tmp':
+                    raise OSError('deliberate final export failure')
+                return original_export(path, rows)
+            with (patch.object(barcode, 'validate_runtime'),
+                  patch.object(barcode, 'process_page', side_effect=self.decoded_page),
+                  patch.object(barcode, '_close_worker_document'),
+                  patch.object(classify.mp, 'get_context', return_value=context),
+                  patch.object(classify, 'write_page_workbook', side_effect=export)):
+                with self.assertRaisesRegex(OSError, 'final export'):
+                    classify.run(args)
+            output = root / 'output'
+            for lot in ('1', '2', '3'):
+                self.assertTrue((output / f'T5708495/{lot}_2.pdf').is_file())
+                self.assertTrue((output / f'lot_reports/{lot}/pages.xlsx').is_file())
+            with (output / 'results.csv').open(encoding='utf-8-sig', newline='') as handle:
+                self.assertEqual(len(list(csv.DictReader(handle))), 6)
+            self.assertIn('Batch status: FAILED', (output / 'report.txt').read_text())
+            self.assertIn('Lots published: 3', (output / 'report.txt').read_text())
+
+    def test_publish_failure_keeps_saved_lots_and_current_lot_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args, context = self.prepare_failure_batch(root)
+            original_rename = Path.rename
+            def rename(path, target):
+                if Path(target).resolve() == (root / 'output/T5708495/2_2.pdf').resolve():
+                    raise OSError('deliberate publication failure')
+                return original_rename(path, target)
+            with (patch.object(barcode, 'validate_runtime'),
+                  patch.object(barcode, 'process_page', side_effect=self.decoded_page),
+                  patch.object(barcode, '_close_worker_document'),
+                  patch.object(classify.mp, 'get_context', return_value=context),
+                  patch.object(Path, 'rename', rename)):
+                self.assertEqual(classify.run(args), 1)
+            output = root / 'output'
+            self.assertTrue((output / 'T5708495/1_2.pdf').is_file())
+            self.assertTrue((output / 'T5708495/2_1.pdf').is_file())
+            self.assertTrue((output / 'T5708495/3_2.pdf').is_file())
+            self.assertTrue(list((output / '_incomplete').glob('2_*/T5708495/2_2.pdf')))
+            self.assertTrue(list((output / '_incomplete').glob('2_*/_reports/results.csv')))
+            self.assertTrue(list((output / '_incomplete').glob('2_*/_reports/pages.xlsx')))
+            self.assertIn('Lot 2: FAILED', (output / 'report.txt').read_text())
+
     def test_database_discovery_ignores_search_list_and_temporary_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -197,6 +326,20 @@ class WorkflowTests(unittest.TestCase):
                 self.assertTrue(task.six_digit_badges)
                 self.assertEqual(page_count(Path(task.pdf_path)), 1)
                 name = Path(task.pdf_path).name
+                output = root / 'output'
+                if task.lot == '479':
+                    self.assertFalse(list(output.glob('T5708495/*.pdf')))
+                    self.assertFalse(list((output / 'OCR').glob('*.pdf')))
+                elif task.lot == '500':
+                    self.assertTrue((output / 'T5708495/479_1.pdf').is_file())
+                    self.assertTrue((output / 'OCR/479_2.pdf').is_file())
+                    self.assertTrue((output / 'lot_reports/479/pages.xlsx').is_file())
+                    with (output / 'results.csv').open(encoding='utf-8-sig', newline='') as handle:
+                        saved = list(csv.DictReader(handle))
+                    self.assertEqual(len(saved), 3)
+                    self.assertTrue(all(row['Lot'] == '479' for row in saved))
+                    self.assertIn('Lots published: 1', (output / 'report.txt').read_text())
+                    self.assertFalse((output / 'T5708495/500_1.pdf').exists())
                 scanned.append(name)
                 values = {
                     '479_1.pdf': {'badges': ('100000',)},
@@ -215,7 +358,7 @@ class WorkflowTests(unittest.TestCase):
             with (patch.object(barcode, 'validate_runtime'),
                   patch.object(barcode, 'process_page', side_effect=scan),
                   patch.object(barcode, '_close_worker_document'),
-                  patch.object(classify.time, 'perf_counter', side_effect=[100.0, 190.25]) as clock,
+                  patch.object(classify.time, 'perf_counter', side_effect=itertools.count(100.0, 10.0)) as clock,
                   patch.object(classify, 'load_database', wraps=classify.load_database) as load_bdd,
                   patch.object(classify.mp, 'get_context', return_value=SimpleNamespace(Pool=lambda *a, **k: Pool()))):
                 original_loader = load_bdd._mock_wraps
@@ -260,12 +403,19 @@ class WorkflowTests(unittest.TestCase):
             report = (output / 'report.txt').read_text()
             self.assertIn('Start time:', report)
             self.assertIn('Finish time:', report)
-            self.assertIn('Total processing time: 00:01:30', report)
-            self.assertIn('Total processing seconds: 90.250', report)
+            self.assertIn('Total processing time: 00:01:50', report)
+            self.assertIn('Total processing seconds: 110.000', report)
             log = (output / 'processing.log').read_text()
             self.assertIn('Batch started:', log)
             self.assertIn('Batch finished:', log)
-            self.assertIn('00:01:30 (90.250 seconds)', log)
+            self.assertIn('00:01:50 (110.000 seconds)', log)
+            self.assertIn('Lot 479 | START', log)
+            self.assertIn('Lot 479 | SAVED_WITH_ISSUES | duration=00:00:10 (10.000 seconds)', log)
+            with (output / 'lots.csv').open(encoding='utf-8-sig', newline='') as handle:
+                timing = list(csv.DictReader(handle))
+            self.assertEqual([row['Lot'] for row in timing], ['479', '500', '501'])
+            self.assertEqual([row['Seconds'] for row in timing], ['10.000'] * 3)
+            self.assertEqual(timing[-1]['Status'], 'FAILED')
             self.assertEqual(len(list(root.glob('output_backup_*/old.txt'))), 1)
             self.assertFalse(list(root.glob('.classify_pages_*')))
             for path, content in originals.items():
@@ -276,7 +426,7 @@ class WorkflowTests(unittest.TestCase):
                                      excel=Path('/batch/list.xlsx'), database=Path('/BDD.xlsx'))
         self.assertEqual(command[-6:], ['-n', '3', '--excel', '/batch/list.xlsx', '--database', '/BDD.xlsx'])
 
-    def test_fatal_split_failure_preserves_previous_output(self):
+    def test_fatal_split_failure_preserves_previous_output_in_backup(self):
         from openpyxl import Workbook
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -298,8 +448,11 @@ class WorkflowTests(unittest.TestCase):
                   patch.object(classify.mp, 'get_context', return_value=SimpleNamespace(Pool=lambda *a, **k: Pool()))):
                 with self.assertRaises(barcode.ConfigurationError):
                     classify.run(args)
-            self.assertEqual((root / 'output/old.txt').read_text(), 'keep')
-            self.assertFalse(list(root.glob('output_backup_*')))
+            backups = list(root.glob('output_backup_*/old.txt'))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_text(), 'keep')
+            self.assertIn('Batch status: FAILED', (root / 'output/report.txt').read_text())
+            self.assertTrue(list((root / 'output/_incomplete').glob('1_*')))
             self.assertFalse(list(root.glob('.classify_pages_*')))
 
 

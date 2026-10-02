@@ -178,6 +178,13 @@ output/
   search_list_found.xlsx
   report.txt
   processing.log
+  lots.csv
+  lot_reports/
+    479/
+      pages.xlsx
+      pages.csv
+      results.csv
+      report.txt
 ```
 
 The folder identifier is the VIS (the last eight VIN characters), never the
@@ -208,14 +215,38 @@ search list. The CSV retains raw detections and reasons for investigation.
 The supplied 2025 and 2026 BDD exports have no NOF column, so NOF remains blank
 for those records. The new report has a frozen header and column filters.
 
-`report.txt` records start and finish timestamps with timezone offsets and
-total processing time in `HH:MM:SS` and seconds. Timing starts on entry to
-the operation, before workbook loading and scanner initialization, and ends
-after PDF processing and Excel/CSV export. `processing.log` also records the
-start and finish, and the terminal summary displays the elapsed duration.
+Every lot starts its own timer before PDF discovery and splitting. Its
+duration includes scanning, per-lot Excel/CSV export, PDF publication and
+updating the cumulative CSV and highlighted search list. `processing.log`
+records lot start, split, scan, publication and finish events, with page counts,
+VIS/OCR totals and elapsed time. Failed and interrupted lots also have a
+status and duration. `lots.csv` lists every attempted lot with its start,
+finish, duration in `HH:MM:SS` and seconds, page counts and publication status.
+`report.txt` includes the lot durations and batch status and updates after
+each lot. The whole-batch timer starts before BDD loading and scanner
+initialization and includes the final combined Excel export.
 
-Original PDFs and workbooks are untouched. A completed run replaces
-`output/` while preserving its previous contents in a timestamped backup.
-Fatal failures or interruptions leave the previous published output intact.
-Skipped lots, scan failures and contradictions are reported with a nonzero
-exit code; valid pages from the remaining lots are still published.
+Output is published **lot by lot**. During a lot's scan, its files stay in a
+private working directory inside `output/_incomplete/`. Once the whole lot
+has been processed and its metadata saved, its PDFs are moved to the central
+VIS/OCR folders and its Excel/CSV files become available in
+`output/lot_reports/<lot>/`. The script saves `results.csv`, search-list
+highlighting and the batch summary before starting the next lot. It never
+clears completed lots when a later lot fails or the batch is interrupted.
+An individual lot failure is logged and processing continues with the next
+lot; an interruption stops the batch. Unfinished lot files are retained under
+`_incomplete/`, with their location logged. If publication fails midway,
+already moved files remain in the central folders and the remaining files
+and metadata stay in that lot's working directory.
+
+The combined `output/pages.xlsx` is streamed from the saved per-lot CSVs once
+at batch end, avoiding repeated rewrites of a growing workbook. All per-lot
+Excel reports are already saved before that final export, so an interruption
+or export failure does not lose completed lots' identifiers or PDFs. There
+is no automatic resume or skip mechanism.
+
+Original PDFs and workbooks are untouched. Before lot processing starts,
+an existing `output/` is preserved as a timestamped `output_backup_...`
+directory and a fresh `output/` is opened for progressive results. Validation
+failures before processing leave the old output in place. Skipped lots, scan
+failures and contradictions are reported with a nonzero exit code.
