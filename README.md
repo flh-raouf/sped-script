@@ -130,3 +130,86 @@ python scripts/clean_hidden_files.py -d "/absolute/path/to/client_batch"
 ```
 
 Use `--dry-run` first to list eligible files without deleting anything.
+
+## Split and classify pages by VIS
+
+Select **Split and classify pages by VIS** in `python main.py`, or run:
+
+```bash
+python scripts/classify_pages.py -d "/path/to/batch" -n 8
+```
+
+The consolidated BDD is supplied in `outputs/bdd-2024-2026/`. It contains
+100,888 source rows for 2024, 2025 and 2026, with `Année` as the first column
+and all original data columns retained. `GlobalCounters` and `Filters` from
+the 2024 workbook are metadata, not vehicle records, and are excluded.
+
+Put `BDD_2024_2025_2026.xlsx` and the search list (the existing 229 requested
+Badge/VIS rows) directly inside the selected batch root. The menu and CLI
+automatically detect the BDD `.xlsx` whose name starts with `BDD` and exclude
+it when discovering the search list. Hidden files, Excel lock files and
+`_found` workbooks are ignored. No BDD path prompt is needed in the menu.
+Missing or multiple BDD files produce a clear error. To use a BDD stored
+elsewhere or choose between several files, supply `--database /path/to/BDD.xlsx`
+on the CLI; `--excel search_list.xlsx` selects an ambiguous search list.
+Classification applies to every page, including
+vehicles absent from the search list.
+
+Immediate numeric lot folders are processed in numeric order, one lot at a
+time. Each lot must contain exactly one PDF. All pages are first split into
+verified one-page PDFs, then scanned using the existing 300 DPI upper-half
+CodaraScan Panorama Code 39/Code 128 pipeline. Only this new operation also
+accepts six-digit badges. Barcode detection recognises only badges and full
+17-character VINs; VIS is extracted from the last eight VIN characters or
+resolved through the BDD badge mapping. Other barcode payloads are ignored.
+The original extraction operation retains its existing identifier rules.
+
+Outputs are centralised under the batch root:
+
+```text
+output/
+  T5702376/
+    479_1.pdf
+    500_12.pdf
+  OCR/
+    479_2.pdf
+  results.csv
+  pages.xlsx
+  search_list_found.xlsx
+  report.txt
+  processing.log
+```
+
+The folder identifier is the VIS (the last eight VIN characters), never the
+full VIN. A badge-only page uses the BDD badge-to-VIS mapping before falling
+back to `OCR`. Contradictory mappings or multiple distinct VIS values send
+the page to `OCR` with an explicit CSV status; no arbitrary VIS is chosen.
+The CSV distinguishes VIN-derived VIS from the resolved VIS, records
+the destination and any scan error, and retains one row per processed page.
+`FOUND` and green highlighting use the existing search list, including VIS
+resolved through the BDD. OCR is a holding folder; this operation does not
+run text recognition or infer identifiers from neighbouring pages.
+
+`pages.xlsx` contains one row per processed page, sorted by numeric lot and
+page, with columns `lot_page`, `BDG`, `VIN`, `VIS`, `SEQ`, `SEQ_9`, and `NOF`.
+The page identifier omits the PDF extension, for example `479_1`. Resolved
+pages retain decoded Badge/VIN values and query the BDD to fill the other
+fields. In the supplied sources, `SEM` supplies the full `SEQ`, and valid
+17-character VINs are available in `ID2` (explicit VIN and `ID1`/`ID3` columns
+are supported too). `SEQ_9` contains the last nine digits of the full SEQ,
+stored as text to preserve leading zeroes. SEQ is not searched in barcodes.
+Missing source fields remain blank; no VIN is fabricated from a VIS. If a
+lookup leaves multiple possible values for a field, that field remains blank.
+Pages sent to `OCR`, including scan failures and contradictory detections,
+retain their `lot_page` row with all six identifier fields blank. These blank
+rows indicate unresolved pages, independently of membership in the 229-row
+search list. The CSV retains raw detections and reasons for investigation.
+
+The supplied 2025 and 2026 BDD exports have no NOF column, so NOF remains blank
+for those records. The new report has a frozen header and column filters.
+
+Original PDFs and workbooks are untouched. A completed run replaces
+`output/` while preserving its previous contents in a timestamped backup.
+Fatal failures or interruptions leave the previous published output intact.
+Skipped lots, scan failures and contradictions are reported with a nonzero
+exit code; valid pages from the remaining lots are still published.

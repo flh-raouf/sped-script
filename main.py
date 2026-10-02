@@ -7,6 +7,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+from scripts.classify_pages import discover_database
+from scripts.script import ConfigurationError
+
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent / "scripts"
 RECONSTRUCTION_ACTION = "Document reconstruction"
 RECONSTRUCTION_MODES = {
@@ -15,6 +18,7 @@ RECONSTRUCTION_MODES = {
 }
 ACTIONS = {
     "Barcode extraction": "script.py",
+    "Split and classify pages by VIS": "classify_pages.py",
     RECONSTRUCTION_ACTION: None,
     "Clean hidden files": "clean_hidden_files.py",
     "Split PDFs into individual pages (éclatement)": "split_pages.py",
@@ -47,18 +51,20 @@ def valid_workers(value: str) -> bool:
 
 def build_command(
     script: str, directory: Path, *, workers: int = 1,
-    dry_run: bool = False, excel: Path | None = None,
+    dry_run: bool = False, excel: Path | None = None, database: Path | None = None,
 ) -> list[str]:
     if script not in SUPPORTED_SCRIPTS:
         raise ValueError(f"Unknown operation: {script}")
     command = [sys.executable, "-u", str(SCRIPT_DIRECTORY / script),
                "-d", str(directory)]
-    if script == "script.py":
+    if script in {"script.py", "classify_pages.py"}:
         if workers <= 0:
             raise ValueError("Workers must be greater than zero.")
         command.extend(["-n", str(workers)])
         if excel is not None:
             command.extend(["--excel", str(excel)])
+        if script == "classify_pages.py" and database is not None:
+            command.extend(["--database", str(database)])
     elif script == "clean_hidden_files.py" and dry_run:
         command.append("--dry-run")
     return command
@@ -123,18 +129,22 @@ def main() -> int:
             ).execute()
             directory = normalize_directory(path_text)
             last_directory = str(directory)
-            workers, dry_run, excel = 1, False, None
-            if script == "script.py":
+            workers, dry_run, excel, database = 1, False, None, None
+            if script in {"script.py", "classify_pages.py"}:
                 workers = int(inquirer.text(
                     message="Number of workers:", default="1",
                     validate=valid_workers,
                     invalid_message="Enter a whole number greater than zero.",
                 ).execute())
+                if script == "classify_pages.py":
+                    database = discover_database(directory)
+                    print(f"BDD detected: {database.name}", flush=True)
                 workbooks = sorted(
                     path for path in directory.iterdir()
                     if path.is_file() and path.suffix.lower() in {".xlsx", ".xlsm"}
                     and not path.name.startswith(("~$", "."))
                     and not path.stem.lower().endswith("_found")
+                    and path.resolve() != database
                 )
                 if not workbooks:
                     print("No source Excel workbook found directly in this folder.\n")
@@ -161,7 +171,7 @@ def main() -> int:
                     continue
 
             command = build_command(script, directory, workers=workers,
-                                    dry_run=dry_run, excel=excel)
+                                    dry_run=dry_run, excel=excel, database=database)
             print(f"\n{display_action}\nFolder: {directory}\n", flush=True)
             code = execute_command(command)
             if code == 0:
@@ -173,7 +183,7 @@ def main() -> int:
             inquirer.text(message="Press Enter to return to the menu:").execute()
         except (KeyboardInterrupt, EOFError):
             print("\nReturning to menu.\n")
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, ConfigurationError) as exc:
             print(f"\nCould not run operation: {exc}\n", file=sys.stderr)
 
 

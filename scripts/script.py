@@ -90,6 +90,7 @@ class PageTask:
     pdf_path: str
     page_index: int
     pages_in_lot: int
+    six_digit_badges: bool = False
 
 
 @dataclass(frozen=True)
@@ -602,6 +603,10 @@ def process_page(task: PageTask) -> PageResult:
             if not isinstance(symbol, DecodedSymbolResult):
                 continue
             classified = classify_decoded_value(symbol.text)
+            if classified is None and task.six_digit_badges:
+                text = str(symbol.text).strip().upper()
+                if re.fullmatch(r"[0-9]{1,6}", text):
+                    classified = ("badge", text)
             if classified is None:
                 continue
             kind, value = classified
