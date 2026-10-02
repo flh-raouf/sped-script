@@ -215,7 +215,14 @@ class WorkflowTests(unittest.TestCase):
             with (patch.object(barcode, 'validate_runtime'),
                   patch.object(barcode, 'process_page', side_effect=scan),
                   patch.object(barcode, '_close_worker_document'),
+                  patch.object(classify.time, 'perf_counter', side_effect=[100.0, 190.25]) as clock,
+                  patch.object(classify, 'load_database', wraps=classify.load_database) as load_bdd,
                   patch.object(classify.mp, 'get_context', return_value=SimpleNamespace(Pool=lambda *a, **k: Pool()))):
+                original_loader = load_bdd._mock_wraps
+                def timed_loader(path):
+                    self.assertEqual(clock.call_count, 1)  # Timing starts before BDD loading.
+                    return original_loader(path)
+                load_bdd.side_effect = timed_loader
                 code = classify.run(args)
             self.assertEqual(code, 1)
             output = root / 'output'
@@ -250,6 +257,15 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(sheet['F2'].number_format, '@')
             pages.close()
             self.assertIn('Lot 501: no PDF found', (output / 'report.txt').read_text())
+            report = (output / 'report.txt').read_text()
+            self.assertIn('Start time:', report)
+            self.assertIn('Finish time:', report)
+            self.assertIn('Total processing time: 00:01:30', report)
+            self.assertIn('Total processing seconds: 90.250', report)
+            log = (output / 'processing.log').read_text()
+            self.assertIn('Batch started:', log)
+            self.assertIn('Batch finished:', log)
+            self.assertIn('00:01:30 (90.250 seconds)', log)
             self.assertEqual(len(list(root.glob('output_backup_*/old.txt'))), 1)
             self.assertFalse(list(root.glob('.classify_pages_*')))
             for path, content in originals.items():

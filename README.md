@@ -208,6 +208,12 @@ search list. The CSV retains raw detections and reasons for investigation.
 The supplied 2025 and 2026 BDD exports have no NOF column, so NOF remains blank
 for those records. The new report has a frozen header and column filters.
 
+`report.txt` records start and finish timestamps with timezone offsets and
+total processing time in `HH:MM:SS` and seconds. Timing starts on entry to
+the operation, before workbook loading and scanner initialization, and ends
+after PDF processing and Excel/CSV export. `processing.log` also records the
+start and finish, and the terminal summary displays the elapsed duration.
+
 Original PDFs and workbooks are untouched. A completed run replaces
 `output/` while preserving its previous contents in a timestamped backup.
 Fatal failures or interruptions leave the previous published output intact.

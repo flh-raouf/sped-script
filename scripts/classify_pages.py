@@ -9,8 +9,10 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 
 if __package__:
@@ -221,6 +223,8 @@ def discover_database(root: Path, explicit: Path | None = None) -> Path:
 
 
 def run(args: argparse.Namespace) -> int:
+    started_clock = time.perf_counter()
+    started_at = datetime.now().astimezone()
     from pypdf import PdfReader
     root = split.validate_root(args.directory)
     database_path = discover_database(root, args.database)
@@ -247,6 +251,8 @@ def run(args: argparse.Namespace) -> int:
     output = root / 'output'
     staging = Path(tempfile.mkdtemp(prefix='.classify_pages_', dir=root))
     logger = barcode.configure_logging(staging)
+    logger.info('Batch started: %s | root=%s | workers=%d',
+                started_at.isoformat(timespec='seconds'), root, args.workers)
     records = []
     page_rows = []
     matches: set[barcode.RowRef] = set()
@@ -323,16 +329,26 @@ def run(args: argparse.Namespace) -> int:
             writer.writerows(records)
         barcode.atomic_text_write(staging / 'results.csv', write_csv, newline='', encoding='utf-8-sig')
         barcode.highlight_workbook(target_path, staging / f'{target_path.stem}_found{target_path.suffix}', matches)
-        lines = [f'BDD: {database_path.name}', f'Search list: {target_path.name}',
+        finished_at = datetime.now().astimezone()
+        elapsed = time.perf_counter() - started_clock
+        duration = barcode.format_duration(elapsed)
+        lines = [f'Start time: {started_at.isoformat(timespec="seconds")}',
+                 f'Finish time: {finished_at.isoformat(timespec="seconds")}',
+                 f'Total processing time: {duration}',
+                 f'Total processing seconds: {elapsed:.3f}',
+                 '', f'BDD: {database_path.name}', f'Search list: {target_path.name}',
                  'Page workbook: pages.xlsx',
                  f'Lots discovered: {len(lots)}', f'Pages processed: {total}',
                  f'Pages classified by VIS: {classified}', f'Pages in OCR: {ocr}',
                  f'Found: {len(matches)}/{len(targets.rows)}', f'Issues: {len(issues)}',
                  *[f'- {issue}' for issue in issues]]
         barcode.atomic_text_write(staging / 'report.txt', lambda handle: handle.write('\n'.join(lines) + '\n'))
+        logger.info('Batch finished: %s | total processing time=%s (%.3f seconds) | pages=%d',
+                    finished_at.isoformat(timespec='seconds'), duration, elapsed, total)
         split.close_logger(logger)
         split.publish_staging_directory(staging, output, split.unique_backup_path(output))
-        print(f'Finished: {classified} classified, {ocr} OCR; FOUND {len(matches)}/{len(targets.rows)}; {output}')
+        print(f'Finished in {duration}: {classified} classified, {ocr} OCR; '
+              f'FOUND {len(matches)}/{len(targets.rows)}; {output}')
         return 1 if issues else 0
     finally:
         split.close_logger(logger)
