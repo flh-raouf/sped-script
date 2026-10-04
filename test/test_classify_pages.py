@@ -15,6 +15,25 @@ from test_split_pages import make_pdf, page_count, page_text
 
 
 class ResolutionTests(unittest.TestCase):
+    def test_publish_lot_ignores_appledouble_sidecars_on_removable_drives(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work, output = root / 'work', root / 'output'
+            (work / 'OCR').mkdir(parents=True)
+            (work / '_reports').mkdir()
+            (output / 'OCR').mkdir(parents=True)
+            (output / 'lot_reports').mkdir()
+            (output / '._OCR').write_bytes(b'existing metadata')
+            (work / '._OCR').write_bytes(b'directory metadata')
+            (work / 'OCR' / '1_1.pdf').write_bytes(b'real PDF')
+            (work / 'OCR' / '._1_1.pdf').write_bytes(b'PDF metadata')
+            (work / 'OCR' / '.DS_Store').write_bytes(b'Finder metadata')
+            (work / '._reports').write_bytes(b'report metadata')
+            classify.publish_lot(work, output, '1')
+            self.assertEqual((output / 'OCR' / '1_1.pdf').read_bytes(), b'real PDF')
+            self.assertFalse((output / 'OCR' / '._1_1.pdf').exists())
+            self.assertFalse(work.exists())
+
     def test_report_enrichment_preserves_zeroes_and_leaves_unknowns_blank(self):
         record = classify.VehicleRecord('00123', 'VF1ABCDEFT5702376', 'T5702376',
                                         'SEQEMON0100000123', '4A2D0004')

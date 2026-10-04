@@ -33,6 +33,7 @@ class VehicleRecord:
     vis: str = ''
     seq: str = ''
     nof: str = ''
+    year: int | None = None
 
 
 @dataclass
@@ -75,6 +76,7 @@ def load_database(path: Path) -> DatabaseIndex:
             bi, vi, headers = columns
             seq_col = next((i for i, h in enumerate(headers) if h in {'seq', 'sem', 'sequence'}), None)
             nof_col = next((i for i, h in enumerate(headers) if h == 'nof'), None)
+            year_col = next((i for i, h in enumerate(headers) if h in {'annee', 'year'}), None)
             vin_cols = [i for i, h in enumerate(headers) if h in barcode.VIN_HEADERS | {'id1', 'id2', 'id3'}]
             for row in rows:
                 badge_cell = row[bi]
@@ -97,10 +99,12 @@ def load_database(path: Path) -> DatabaseIndex:
                     mapping[badge].add(vis)
                 vins = {vin for i in vin_cols if (vin := barcode.normalize_vin(row[i].value))
                         and vin[-8:] == vis}
+                year = text_value(row[year_col].value) if year_col is not None else ''
                 records[vis].append(VehicleRecord(
                     badge=badge, vin=next(iter(vins)) if len(vins) == 1 else '', vis=vis,
                     seq=text_value(row[seq_col].value) if seq_col is not None else '',
                     nof=text_value(row[nof_col].value) if nof_col is not None else '',
+                    year=int(year) if re.fullmatch(r'[0-9]{4}', year) else None,
                 ))
     finally:
         workbook.close()
@@ -339,19 +343,31 @@ def process_lot(lot: Path, state: LotRun, pool, database: DatabaseIndex,
 
 def publish_lot(work: Path, output: Path, lot_name: str) -> None:
     """Publish this lot at its boundary; never replace earlier lots' files."""
+    def remove_generated_metadata(directory: Path) -> None:
+        # macOS creates these sidecars on exFAT drives. This is private staging,
+        # so discard its filesystem metadata while preserving every real PDF.
+        for entry in directory.iterdir():
+            if entry.is_file() and (entry.name.startswith('._') or entry.name == '.DS_Store'):
+                entry.unlink(missing_ok=True)
+
+    remove_generated_metadata(work)
     for directory in sorted(work.iterdir()):
         if directory.name == '_reports':
             continue
         destination = output / directory.name
         destination.mkdir(exist_ok=True)
         for pdf in sorted(directory.glob('*.pdf')):
+            if pdf.name.startswith('.'):
+                continue
             target = destination / pdf.name
             if target.exists():
                 raise FileExistsError(f'Output collision: {target}')
             pdf.rename(target)
+        remove_generated_metadata(directory)
         directory.rmdir()
     # The complete per-lot metadata is already on disk before any PDF moves.
     (work / '_reports').rename(output / 'lot_reports' / lot_name)
+    remove_generated_metadata(work)
     work.rmdir()
 
 

@@ -19,6 +19,7 @@ RECONSTRUCTION_MODES = {
 ACTIONS = {
     "Barcode extraction": "script.py",
     "Split and classify pages by VIS": "classify_pages.py",
+    "Recover pages with OCR (PP-OCRv6 tiny)": "ocr_pages.py",
     RECONSTRUCTION_ACTION: None,
     "Clean hidden files": "clean_hidden_files.py",
     "Split PDFs into individual pages (éclatement)": "split_pages.py",
@@ -52,6 +53,7 @@ def valid_workers(value: str) -> bool:
 def build_command(
     script: str, directory: Path, *, workers: int = 1,
     dry_run: bool = False, excel: Path | None = None, database: Path | None = None,
+    output: Path | None = None,
 ) -> list[str]:
     if script not in SUPPORTED_SCRIPTS:
         raise ValueError(f"Unknown operation: {script}")
@@ -65,6 +67,11 @@ def build_command(
             command.extend(["--excel", str(excel)])
         if script == "classify_pages.py" and database is not None:
             command.extend(["--database", str(database)])
+    elif script == "ocr_pages.py":
+        if database is not None:
+            command.extend(["--database", str(database)])
+        if output is not None:
+            command.extend(["--output", str(output)])
     elif script == "clean_hidden_files.py" and dry_run:
         command.append("--dry-run")
     return command
@@ -130,6 +137,7 @@ def main() -> int:
             directory = normalize_directory(path_text)
             last_directory = str(directory)
             workers, dry_run, excel, database = 1, False, None, None
+            output = None
             if script in {"script.py", "classify_pages.py"}:
                 workers = int(inquirer.text(
                     message="Number of workers:", default="1",
@@ -156,6 +164,13 @@ def main() -> int:
                         choices=[path.name for path in workbooks],
                     ).execute()
                     excel = directory / selected
+            elif script == "ocr_pages.py":
+                output_text = inquirer.filepath(
+                    message="Root containing the VIS folders:", default=str(directory.parent),
+                    only_directories=True, validate=valid_directory,
+                    invalid_message="Enter an existing destination folder.",
+                ).execute()
+                output = normalize_directory(output_text)
             elif script == "clean_hidden_files.py":
                 mode = inquirer.select(
                     message="Cleaning mode:",
@@ -171,7 +186,7 @@ def main() -> int:
                     continue
 
             command = build_command(script, directory, workers=workers,
-                                    dry_run=dry_run, excel=excel, database=database)
+                                    dry_run=dry_run, excel=excel, database=database, output=output)
             print(f"\n{display_action}\nFolder: {directory}\n", flush=True)
             code = execute_command(command)
             if code == 0:

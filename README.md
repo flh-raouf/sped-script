@@ -32,7 +32,7 @@ activated. On Windows use `python main.py`.
 The launcher stays at the project root. All processing utilities and their
 shared reconstruction code live in `scripts/`; tests live in `test/`.
 
-Select extraction, document reconstruction, hidden-file cleaning, or page
+Select extraction, OCR recovery, document reconstruction, hidden-file cleaning, or page
 splitting with the arrow keys and Enter. Reconstruction then asks whether to
 use identified pages only or local ranges. Enter the root folder (the last
 folder is remembered for this session). Extraction asks for workers and, when
@@ -250,3 +250,86 @@ an existing `output/` is preserved as a timestamped `output_backup_...`
 directory and a fresh `output/` is opened for progressive results. Validation
 failures before processing leave the old output in place. Skipped lots, scan
 failures and contradictions are reported with a nonzero exit code.
+
+## Recover unresolved pages with cached OCR
+
+Install the additional OCR dependencies in the environment used to run the script:
+
+```bash
+python -m pip install -r requirements-ocr.txt
+python scripts/ocr_pages.py -d "/path/to/output/OCR"
+```
+
+The input is the folder you supply directly: only its immediate PDF files are
+processed, and each must contain exactly one page. No folder named `OCR` is
+searched for. The destination defaults to the input's parent, so identified
+pages join the existing VIS folders alongside barcode results. Specify
+`--output "/path/to/existing/output"` for a different destination.
+The consolidated `BDD*.xlsx` is detected in the input, destination, or
+destination's parent; `--database "/path/to/BDD.xlsx"` overrides discovery.
+Multiple candidate BDD workbooks require an explicit selection. This operation
+is also available from `python main.py`.
+
+OCR uses `PP-OCRv6_tiny_det` and `PP-OCRv6_tiny_rec`, on CPU by default,
+with full-page rendering at 200 DPI. Optional `--dpi` and `--device` change
+these settings. Paddle downloads the two models on first use and reuses its
+local model cache afterwards. Internet access is needed for that first download.
+
+The BDD is indexed once in memory by full VIN, VIS, badge, and sequence, rather than
+scanning all Excel rows for every page. A recognised 17-character VIN must
+match the BDD. A badge or nine-digit sequence is accepted when linked spatially
+to its label (`BDG`/`Badge` or `SEQ`/`Séquence`). Without labels, a badge and
+sequence must corroborate each other. Operator badges are excluded. The default
+minimum OCR score is 0.8 (`--min-score` overrides it). A directly printed
+eight-character VIS is also accepted when it is a complete token and exists
+in the BDD, with or without a `VIS` label. Substrings of longer VINs or SEL
+codes are not accepted as direct VIS values. Missing metadata is enriched from
+the matching BDD records. Contradictory or ambiguous matches
+go to `Review`; the script does not guess or make fuzzy replacements of digits.
+
+Sequence lookup includes the last nine digits of the BDD sequence. The supplied
+example also uses a printed format different from those last nine digits:
+`SEQEMON0118300161` in year 2026 appears as `126183161`. For this exact
+`SEQEMON` format and a known BDD year, an additional document key is indexed:
+last site digit + two-digit year + three-digit day + last three order digits.
+Other formats receive no such conversion. Any key shared by different VIS values
+remains ambiguous unless another reliable identifier resolves it. `SEQ` in the
+output retains the complete BDD value and `SEQ_9` retains its last nine digits;
+the detected printed sequence is recorded separately as `SEQ_DOC` in the CSV.
+The barcode algorithm is unchanged.
+
+Raw OCR results (text, bounding boxes, and confidence scores) are saved after
+each successful page in `DESTINATION/.ocr_cache.sqlite3`. The cache key combines
+the PDF's SHA-256 content hash with the models, rendering settings and runtime
+versions. Moving or renaming an unchanged PDF still permits a cache hit; changed
+PDF content, DPI, device or library versions trigger OCR again. Successful empty
+results are cached too; OCR errors are not. BDD lookup and classification run
+again on every execution, including cache hits, so updating the BDD does not
+require another OCR pass. `--cache "/path/to/cache.sqlite3"` selects a different
+cache file. Deleting the cache forces fresh OCR without altering the PDFs.
+
+Pages keep their `lot_page.pdf` names. By default, each page is moved immediately
+after classification to its VIS folder or `Review`; use `--copy` to retain the
+input PDFs. A different existing PDF with the same destination filename is never
+overwritten, and the source is retained on transfer failure. Byte-identical
+existing destination files can be reused. Existing VIS folders are preserved.
+
+Each execution creates `DESTINATION/ocr_runs/<timestamp>/` with:
+
+- `results.csv`: progressively saved page metadata, decisions, cache hits,
+  individual durations, source/destination paths and errors.
+- `transfers.jsonl`: a durable mapping written before each transfer, so the
+  destination and identified metadata remain available after an interruption.
+- `processing.log` and `report.txt`: folder start, page progress, totals,
+  elapsed time, cache hits, errors and final or interrupted status.
+- `pages.xlsx`: the final seven-column page report (`lot_page`, `BDG`, `VIN`,
+  `VIS`, `SEQ`, `SEQ_9`, `NOF`), enriched from the matching BDD records. Unknown
+  pages retain a row with blank identifiers. Conflicting metadata fields stay
+  blank. The progressive CSV and transferred PDFs remain if final Excel export
+  cannot finish.
+
+This uses normal `pathlib` paths and can be launched on Windows with the same
+Python commands; install the Paddle dependencies for the Windows environment.
+The implementation has been exercised on macOS; Windows execution has not been
+tested here. It does not update the earlier barcode reports or search-list
+highlighting: its own OCR reports record the recovered pages.
