@@ -277,7 +277,7 @@ def append_lot_csv(path: Path, rows: list[tuple]) -> None:
 
 
 def process_lot(lot: Path, state: LotRun, pool, database: DatabaseIndex,
-                targets: barcode.TargetIndex, logger):
+                targets: barcode.TargetIndex, logger, root=None):
     """Prepare one lot privately; nothing reaches VIS/OCR folders during scanning."""
     from pypdf import PdfReader
     pdf, error = split.discover_lot_pdf(lot)
@@ -316,9 +316,11 @@ def process_lot(lot: Path, state: LotRun, pool, database: DatabaseIndex,
         matches.update(page_matches)
         record = barcode.csv_records_for_page(result, targets)[0]
         decoded_vis = sorted({vin[-8:] for vin in result.vins})
+        pdf_location = (str((root/'Output'/vis if vis else root/'OCR')/name)
+                        if root else f'{vis or "OCR"}/{name}')
         records.append((result.lot, result.page_number, record.badge, record.vin,
                         ';'.join(decoded_vis), vis or '', 'FOUND' if page_matches else '',
-                        status, f'{vis or "OCR"}/{name}', result.error or ''))
+                        status, pdf_location, result.error or ''))
         page_rows.append((result.page_number, page_excel_row(result, vis, database)))
         if status.endswith('CONFLICT') or result.error:
             message = (f'Lot {result.lot} page {result.page_number}: {status}; '
@@ -341,7 +343,7 @@ def process_lot(lot: Path, state: LotRun, pool, database: DatabaseIndex,
     return records, matches
 
 
-def publish_lot(work: Path, output: Path, lot_name: str) -> None:
+def publish_lot(work: Path, output: Path, lot_name: str, *, vis_output=None, ocr_output=None) -> None:
     """Publish this lot at its boundary; never replace earlier lots' files."""
     def remove_generated_metadata(directory: Path) -> None:
         # macOS creates these sidecars on exFAT drives. This is private staging,
@@ -351,10 +353,20 @@ def publish_lot(work: Path, output: Path, lot_name: str) -> None:
                 entry.unlink(missing_ok=True)
 
     remove_generated_metadata(work)
+    if vis_output is not None:
+        # Check every collision before publishing any part of a new-layout lot.
+        for directory in work.iterdir():
+            if directory.name == '_reports':
+                continue
+            destination = ocr_output if directory.name == 'OCR' else vis_output/directory.name
+            for pdf in directory.glob('*.pdf'):
+                if not pdf.name.startswith('.') and (destination/pdf.name).exists():
+                    raise FileExistsError(f'Output collision: {destination/pdf.name}')
     for directory in sorted(work.iterdir()):
         if directory.name == '_reports':
             continue
-        destination = output / directory.name
+        destination = ((ocr_output if directory.name == 'OCR' else vis_output/directory.name)
+                       if vis_output is not None else output/directory.name)
         destination.mkdir(exist_ok=True)
         for pdf in sorted(directory.glob('*.pdf')):
             if pdf.name.startswith('.'):
@@ -452,18 +464,25 @@ def run(args: argparse.Namespace) -> int:
     lots = split.discover_lot_directories(root)
     if not lots:
         raise barcode.ConfigurationError('No numeric Lot folders found')
-    output = root / 'output'
-    initial = Path(tempfile.mkdtemp(prefix='.classify_pages_', dir=root))
-    try:
-        split.publish_staging_directory(initial, output, split.unique_backup_path(output))
-    finally:
-        if initial.exists():
-            shutil.rmtree(initial)
+    if args.legacy_layout:
+        output = root / 'output'
+        initial = Path(tempfile.mkdtemp(prefix='.classify_pages_', dir=root))
+        try:
+            split.publish_staging_directory(initial, output, split.unique_backup_path(output))
+        finally:
+            if initial.exists():
+                shutil.rmtree(initial)
+    else:
+        output = root/'Reports'/'barcode'/started_at.strftime('%Y%m%d_%H%M%S_%f')
+        output.mkdir(parents=True)
+        (root/'Output').mkdir(exist_ok=True)
+        (root/'OCR').mkdir(exist_ok=True)
     logger = barcode.configure_logging(output)
     logger.info('Batch started: %s | root=%s | workers=%d | lots=%d',
                 started_at.isoformat(timespec='seconds'), root, args.workers, len(lots))
     logger.info('Setup complete | BDD badges=%d | requested rows=%d', len(database.badge_vis), len(targets.rows))
-    (output / 'OCR').mkdir()
+    if args.legacy_layout:
+        (output / 'OCR').mkdir()
     (output / 'lot_reports').mkdir()
     incomplete = output / '_incomplete'
     incomplete.mkdir()
@@ -487,9 +506,14 @@ def run(args: argparse.Namespace) -> int:
                 print(f'Lot {lot.name} | START | {active.started_at.isoformat(timespec="seconds")}', flush=True)
                 try:
                     active.work = Path(tempfile.mkdtemp(prefix=f'{lot.name}_', dir=incomplete))
-                    records, lot_matches = process_lot(lot, active, pool, database, targets, logger)
+                    records, lot_matches = process_lot(lot, active, pool, database, targets, logger,
+                                                      None if args.legacy_layout else root)
                     logger.info('Lot %s | PUBLISH START | pages=%d', lot.name, active.processed_pages)
-                    publish_lot(active.work, output, lot.name)
+                    if args.legacy_layout:
+                        publish_lot(active.work, output, lot.name)
+                    else:
+                        publish_lot(active.work, output, lot.name,
+                                    vis_output=root/'Output', ocr_output=root/'OCR')
                     active.published = True
                     matches.update(lot_matches)
                     append_lot_csv(output / 'results.csv', records)
@@ -552,6 +576,7 @@ def parse_args(argv=None):
     parser.add_argument('-n', '--workers', type=int, default=1)
     parser.add_argument('--database', type=Path, help='Override the BDD .xlsx discovered in the parent folder')
     parser.add_argument('--excel', type=Path, help='Search list directly inside the batch root')
+    parser.add_argument('--legacy-layout', action='store_true', help='Use the old output folder layout')
     args = parser.parse_args(argv)
     if args.workers <= 0:
         parser.error('Workers must be greater than zero')

@@ -179,7 +179,7 @@ class WorkflowTests(unittest.TestCase):
             def __exit__(self, *args): pass
             def imap_unordered(self, function, tasks, chunksize):
                 return (function(task) for task in tasks)
-        return classify.parse_args(['-d', str(root)]), SimpleNamespace(Pool=lambda *a, **k: Pool())
+        return classify.parse_args(['--legacy-layout', '-d', str(root)]), SimpleNamespace(Pool=lambda *a, **k: Pool())
 
     @staticmethod
     def decoded_page(task):
@@ -299,7 +299,7 @@ class WorkflowTests(unittest.TestCase):
                 (root / name).touch()
             self.assertEqual(classify.discover_database(root),
                              (root / 'BDD_2024_2025_2026.xlsx').resolve())
-            self.assertIsNone(classify.parse_args(['-d', str(root)]).database)
+            self.assertIsNone(classify.parse_args(['--legacy-layout', '-d', str(root)]).database)
             (root / 'bdd24-26.xlsx').touch()
             with self.assertRaisesRegex(barcode.ConfigurationError, 'Multiple BDD'):
                 classify.discover_database(root)
@@ -373,7 +373,7 @@ class WorkflowTests(unittest.TestCase):
                 def __exit__(self, *args): pass
                 def imap_unordered(self, function, tasks, chunksize):
                     return (function(task) for task in reversed(tasks))
-            args = classify.parse_args(['-d', str(root)])
+            args = classify.parse_args(['--legacy-layout', '-d', str(root)])
             with (patch.object(barcode, 'validate_runtime'),
                   patch.object(barcode, 'process_page', side_effect=scan),
                   patch.object(barcode, '_close_worker_document'),
@@ -462,7 +462,7 @@ class WorkflowTests(unittest.TestCase):
             class Pool:
                 def __enter__(self): return self
                 def __exit__(self, *args): pass
-            args = classify.parse_args(['-d', str(root), '--database', 'BDD.xlsx'])
+            args = classify.parse_args(['--legacy-layout', '-d', str(root), '--database', 'BDD.xlsx'])
             with (patch.object(barcode, 'validate_runtime'),
                   patch.object(classify.mp, 'get_context', return_value=SimpleNamespace(Pool=lambda *a, **k: Pool()))):
                 with self.assertRaises(barcode.ConfigurationError):

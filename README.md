@@ -131,6 +131,51 @@ python scripts/clean_hidden_files.py -d "/absolute/path/to/client_batch"
 
 Use `--dry-run` first to list eligible files without deleting anything.
 
+## Three-stage classification: select the same parent folder
+
+Use the same parent path for all three menu actions, in this order:
+
+1. **Split and classify pages by VIS**: numbered lots → `Output/<VIS>/` or `OCR/`.
+2. **Recover pages with OCR (PP-OCRv6 tiny)**: `OCR/` → `Output/<VIS>/` or `Pending/`.
+3. **Classify remaining pages (parts tables and sparse backs)**: `Pending/` → `Output/<VIS>/` or final `Review/`.
+
+```text
+Parent/
+  1/                         Original lots, unchanged
+  2/
+  BDD_2024_2025_2026.xlsx
+  search_list.xlsx
+  Output/<VIS>/              All classified pages
+  OCR/                       Awaiting OCR
+  Pending/                   Awaiting tables/verso processing
+  Review/                    Final pages for human review
+  Reports/
+    barcode/<timestamp>/     Per-lot and batch reports
+    ocr/<timestamp>/         OCR reports
+    review/<timestamp>/      Remaining-page reports
+    .ocr_cache.sqlite3       Shared persistent raw OCR cache
+    review_assignments.jsonl Durable classification provenance
+```
+
+```bash
+python scripts/classify_pages.py -d "/path/to/Parent" -n 8
+python scripts/ocr_pages.py -d "/path/to/Parent"
+python scripts/review_pages.py -d "/path/to/Parent" --cache-only
+```
+
+Only the designated input is scanned at each stage. Missing `OCR` or `Pending`
+folders explain which previous stage to run; empty inputs return successfully
+with “Nothing left to process.” Transfers preserve names and existing VIS folders.
+Barcode execution saves reports in a new timestamped folder and refuses PDF
+collisions before publishing a lot; it does not clear earlier results. Failed
+transfers retain the source for retry and appear in the stage's report.
+
+For existing executions using the old folder structure, add `--legacy-layout`
+to each script. Barcode then retains its original `output/` layout; OCR and
+remaining-page scripts take the direct PDF folder and default VIS destination
+as before. No existing files are migrated automatically. An old cache can also
+be explicitly selected using `--cache`.
+
 ## Split and classify pages by VIS
 
 Select **Split and classify pages by VIS** in `python main.py`, or run:
@@ -164,28 +209,10 @@ accepts six-digit badges. Barcode detection recognises only badges and full
 resolved through the BDD badge mapping. Other barcode payloads are ignored.
 The original extraction operation retains its existing identifier rules.
 
-Outputs are centralised under the batch root:
-
-```text
-output/
-  T5702376/
-    479_1.pdf
-    500_12.pdf
-  OCR/
-    479_2.pdf
-  results.csv
-  pages.xlsx
-  search_list_found.xlsx
-  report.txt
-  processing.log
-  lots.csv
-  lot_reports/
-    479/
-      pages.xlsx
-      pages.csv
-      results.csv
-      report.txt
-```
+Classified pages are centralised under `Parent/Output/<VIS>/`, with unresolved
+pages in `Parent/OCR/`. Barcode reports, per-lot workbooks, search-list
+highlighting, logs and private unfinished work are saved in
+`Parent/Reports/barcode/<timestamp>/`.
 
 The folder identifier is the VIS (the last eight VIN characters), never the
 full VIN. A badge-only page uses the BDD badge-to-VIS mapping before falling
@@ -227,10 +254,10 @@ each lot. The whole-batch timer starts before BDD loading and scanner
 initialization and includes the final combined Excel export.
 
 Output is published **lot by lot**. During a lot's scan, its files stay in a
-private working directory inside `output/_incomplete/`. Once the whole lot
+private working directory inside `Reports/barcode/<timestamp>/_incomplete/`. Once the whole lot
 has been processed and its metadata saved, its PDFs are moved to the central
 VIS/OCR folders and its Excel/CSV files become available in
-`output/lot_reports/<lot>/`. The script saves `results.csv`, search-list
+`Reports/barcode/<timestamp>/lot_reports/<lot>/`. The script saves `results.csv`, search-list
 highlighting and the batch summary before starting the next lot. It never
 clears completed lots when a later lot fails or the batch is interrupted.
 An individual lot failure is logged and processing continues with the next
@@ -239,17 +266,16 @@ lot; an interruption stops the batch. Unfinished lot files are retained under
 already moved files remain in the central folders and the remaining files
 and metadata stay in that lot's working directory.
 
-The combined `output/pages.xlsx` is streamed from the saved per-lot CSVs once
+The combined `Reports/barcode/<timestamp>/pages.xlsx` is streamed from the saved per-lot CSVs once
 at batch end, avoiding repeated rewrites of a growing workbook. All per-lot
 Excel reports are already saved before that final export, so an interruption
 or export failure does not lose completed lots' identifiers or PDFs. There
 is no automatic resume or skip mechanism.
 
-Original PDFs and workbooks are untouched. Before lot processing starts,
-an existing `output/` is preserved as a timestamped `output_backup_...`
-directory and a fresh `output/` is opened for progressive results. Validation
-failures before processing leave the old output in place. Skipped lots, scan
-failures and contradictions are reported with a nonzero exit code.
+Original PDFs and workbooks are untouched. Existing classified PDFs are never
+overwritten. Skipped lots, scan failures and contradictions are reported with a
+nonzero exit code. The backup-and-replace behavior of the old `output/` folder
+is retained only with `--legacy-layout`.
 
 ## Recover unresolved pages with cached OCR
 
@@ -257,16 +283,14 @@ Install the additional OCR dependencies in the environment used to run the scrip
 
 ```bash
 python -m pip install -r requirements-ocr.txt
-python scripts/ocr_pages.py -d "/path/to/output/OCR"
+python scripts/ocr_pages.py -d "/path/to/Parent"
 ```
 
-The input is the folder you supply directly: only its immediate PDF files are
-processed, and each must contain exactly one page. No folder named `OCR` is
-searched for. The destination defaults to the input's parent, so identified
-pages join the existing VIS folders alongside barcode results. Specify
-`--output "/path/to/existing/output"` for a different destination.
-The consolidated `BDD*.xlsx` is detected in the input, destination, or
-destination's parent; `--database "/path/to/BDD.xlsx"` overrides discovery.
+Supply the parent root used for barcode classification. Only immediate PDFs
+inside its `OCR/` folder are processed, and each must contain exactly one page.
+Identified pages join `Output/<VIS>/`; unresolved pages move to the sibling
+`Pending/` folder. `--output` overrides the VIS destination. The consolidated
+`BDD*.xlsx` is detected in the parent root; `--database` overrides discovery.
 Multiple candidate BDD workbooks require an explicit selection. This operation
 is also available from `python main.py`.
 
@@ -285,7 +309,7 @@ eight-character VIS is also accepted when it is a complete token and exists
 in the BDD, with or without a `VIS` label. Substrings of longer VINs or SEL
 codes are not accepted as direct VIS values. Missing metadata is enriched from
 the matching BDD records. Contradictory or ambiguous matches
-go to `Review`; the script does not guess or make fuzzy replacements of digits.
+go to `Pending`; the script does not guess or make fuzzy replacements of digits.
 
 Sequence lookup includes the last nine digits of the BDD sequence. The supplied
 example also uses a printed format different from those last nine digits:
@@ -299,7 +323,7 @@ the detected printed sequence is recorded separately as `SEQ_DOC` in the CSV.
 The barcode algorithm is unchanged.
 
 Raw OCR results (text, bounding boxes, and confidence scores) are saved after
-each successful page in `DESTINATION/.ocr_cache.sqlite3`. The cache key combines
+each successful page in `Parent/Reports/.ocr_cache.sqlite3`. The cache key combines
 the PDF's SHA-256 content hash with the models, rendering settings and runtime
 versions. Moving or renaming an unchanged PDF still permits a cache hit; changed
 PDF content, DPI, device or library versions trigger OCR again. Successful empty
@@ -309,12 +333,12 @@ require another OCR pass. `--cache "/path/to/cache.sqlite3"` selects a different
 cache file. Deleting the cache forces fresh OCR without altering the PDFs.
 
 Pages keep their `lot_page.pdf` names. By default, each page is moved immediately
-after classification to its VIS folder or `Review`; use `--copy` to retain the
+after classification to its VIS folder or `Pending`; use `--copy` to retain the
 input PDFs. A different existing PDF with the same destination filename is never
 overwritten, and the source is retained on transfer failure. Byte-identical
 existing destination files can be reused. Existing VIS folders are preserved.
 
-Each execution creates `DESTINATION/ocr_runs/<timestamp>/` with:
+Each execution creates `Parent/Reports/ocr/<timestamp>/` with:
 
 - `results.csv`: progressively saved page metadata, decisions, cache hits,
   individual durations, source/destination paths and errors.
@@ -333,3 +357,56 @@ Python commands; install the Paddle dependencies for the Windows environment.
 The implementation has been exercised on macOS; Windows execution has not been
 tested here. It does not update the earlier barcode reports or search-list
 highlighting: its own OCR reports record the recovered pages.
+
+## Classify remaining pages
+
+The menu action **Classify remaining pages (parts tables and sparse backs)** runs
+`scripts/review_pages.py`. Supply the same parent root; it reads immediate PDFs
+from `Pending/`, sends identified pages to `Output/<VIS>/`, and moves unresolved
+pages to the sibling final `Review/`. BDD discovery, tiny models and the OCR
+cache are shared with the OCR stage. Classification rules are unchanged.
+
+```bash
+python scripts/review_pages.py -d "/path/to/Parent"
+# Preview decisions using only existing OCR results:
+python scripts/review_pages.py -d "/path/to/Parent" --cache-only --dry-run
+```
+
+The script first recognizes the parts-table layout: at least three aligned
+ten-digit part references paired with OK/NOK cells, a reference such as
+`98749524F4` above them, and a single badge in the first row. It uses cached text,
+confidence scores and coordinates in all four orientations. The badge must map
+to exactly one VIS in the BDD. A random five-digit number or a different kind
+of table does not satisfy this rule. Default minimum confidence is 0.9.
+
+Other pages can inherit the exact preceding page's VIS within the same lot only
+if their dark-pixel coverage is at most 0.9%, their predecessor was independently
+classified and their OCR contains no conflicting identifier. Coverage is
+measured at 100 DPI with grayscale values below 128, after excluding 2% from
+each of the four edges to reduce scanner borders. The percentage uses the
+remaining interior as its denominator. Only the measurement image is cropped;
+PDFs and full-page OCR/cache remain unchanged. Override the limits with
+`--max-ink-percent`, `--black-threshold` and `--crop-percent` (0 disables cropping).
+Large scanner artifacts extending into the interior can still exceed the cutoff.
+This is a conservative sparse-page
+heuristic, not proof that a page is blank. Inherited pages never become eligible
+predecessors, including on subsequent executions. Missing or ambiguous
+predecessors, unknown table badges and other undecidable pages move to final `Review/`. Transfer/OCR errors retain the source in `Pending/` for retry.
+
+Cache misses run OCR and save successful raw results immediately. `--cache-only`
+keeps misses in Review without running OCR or attempting inheritance. Cache
+settings and runtime versions must match the original OCR execution to get
+hits. `--cache`, `--database`, `--output`, `--dpi`, `--device`, `--min-score`,
+and `--copy` are also supported. Dry runs write preview reports and may populate
+the OCR cache unless `--cache-only` is supplied; they never move PDFs.
+
+Each recovered PDF moves immediately into its existing VIS folder, preserving
+its `lot_page.pdf` name. Different existing destination PDFs are never
+overwritten. `Reports/review_assignments.jsonl` durably records metadata and provenance
+before transfers, preventing inheritance chains after interruptions. Each
+execution creates `Reports/review/<timestamp>/results.csv`, progressively flushed
+after every page, with metadata, method, predecessor, ink coverage, cache status,
+page duration and errors. `processing.log` and `report.txt` record the folder's
+start and total duration. `pages.xlsx` contains all input pages with the seven
+metadata columns, including blank identifiers for unresolved pages. Historical
+barcode/OCR reports remain unchanged; these Review reports describe this stage.

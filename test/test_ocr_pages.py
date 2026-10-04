@@ -167,7 +167,7 @@ class BatchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source, bdd = self.create_batch(root)
-            args = ocr.parse_args(['-d', str(source), '--copy'])
+            args = ocr.parse_args(['--legacy-layout', '-d', str(source), '--copy'])
             def read(path):
                 if path.stem == '1_2':
                     self.assertTrue((root / VIS / '1_1.pdf').is_file())
@@ -198,7 +198,7 @@ class BatchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source, _ = self.create_batch(root)
-            args = ocr.parse_args(['-d', str(source), '--copy'])
+            args = ocr.parse_args(['--legacy-layout', '-d', str(source), '--copy'])
             with patch.object(ocr, 'PaddleEngine') as engine:
                 engine.return_value.read.side_effect = [RuntimeError('scan failed'), []]
                 self.assertEqual(ocr.run(args), 1)

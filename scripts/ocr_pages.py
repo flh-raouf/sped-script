@@ -25,10 +25,12 @@ if __package__:
     from . import classify_pages as classify
     from . import script as barcode
     from . import split_pages as split
+    from . import workflow
 else:
     import classify_pages as classify
     import script as barcode
     import split_pages as split
+    import workflow
 
 DET_MODEL = 'PP-OCRv6_tiny_det'
 REC_MODEL = 'PP-OCRv6_tiny_rec'
@@ -327,19 +329,26 @@ def discover_bdd(source: Path, output: Path, explicit: Path | None) -> Path:
 def run(args) -> int:
     started = time.perf_counter()
     started_at = datetime.now().astimezone()
-    source = split.validate_root(args.directory)
-    output = (args.output or source.parent).expanduser().resolve()
+    split.validate_root(args.directory)
+    paths = workflow.stage_paths(args, 'ocr')
+    source, output = paths.source, paths.output
     if output == source:
         raise barcode.ConfigurationError('Output must differ from the input folder')
-    output.mkdir(parents=True, exist_ok=True)
-    database_path = discover_bdd(source, output, args.database)
-    lookup = Lookup(classify.load_database(database_path))
     files = sorted((path for path in source.iterdir() if path.is_file() and path.suffix.lower() == '.pdf'
                     and not path.name.startswith('.')),
                    key=lambda path: (tuple(int(value) for value in re.findall(r'[0-9]+', path.stem)), path.name))
     if not files:
-        raise barcode.ConfigurationError('No PDFs directly inside the supplied folder')
-    reports = output / 'ocr_runs' / started_at.strftime('%Y%m%d_%H%M%S_%f')
+        if not args.legacy_layout:
+            paths.unresolved.mkdir(parents=True, exist_ok=True)
+        print(f'Nothing left to process in {source}', flush=True)
+        return 0
+    output.mkdir(parents=True, exist_ok=True)
+    if not args.legacy_layout:
+        paths.unresolved.mkdir(parents=True, exist_ok=True)
+    database_path = discover_bdd(source if args.legacy_layout else args.directory.expanduser().resolve(),
+                                 output, args.database)
+    lookup = Lookup(classify.load_database(database_path))
+    reports = paths.reports / started_at.strftime('%Y%m%d_%H%M%S_%f')
     reports.mkdir(parents=True)
     logger = logging.getLogger('ocr_recovery')
     logger.setLevel(logging.INFO)
@@ -348,7 +357,7 @@ def run(args) -> int:
     handler = logging.FileHandler(reports / 'processing.log', encoding='utf-8')
     handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
     logger.addHandler(handler)
-    cache = OcrCache((args.cache or output / '.ocr_cache.sqlite3').expanduser(), ocr_settings(args.dpi, args.device))
+    cache = OcrCache((args.cache or paths.cache).expanduser(), ocr_settings(args.dpi, args.device))
     engine = None
     hits = recovered = review = errors = attempted = 0
     classify.save_csv(reports / 'results.csv',
@@ -360,7 +369,8 @@ def run(args) -> int:
         text = (f'Status: {status}\nStart: {started_at.isoformat()}\n'
                 f'Updated: {datetime.now().astimezone().isoformat()}\n'
                 f'Total duration: {barcode.format_duration(elapsed)} ({elapsed:.3f} seconds)\n'
-                f'Pages attempted: {attempted}/{len(files)}\nRecovered: {recovered}\nReview: {review}\n'
+                f'Pages attempted: {attempted}/{len(files)}\nRecovered: {recovered}\n'
+                f'{paths.unresolved.name}: {review}\n'
                 f'OCR cache hits: {hits}\nErrors: {errors}\nBDD: {database_path}\n')
         barcode.atomic_text_write(reports / 'report.txt', lambda handle: handle.write(text))
     try:
@@ -391,7 +401,7 @@ def run(args) -> int:
                     cache.put(digest, lines)
                 decision = resolve_text(lines, lookup, args.min_score)
                 enriched = enriched_row(path.stem, decision, lookup.database)
-                destination = output / (decision.vis or 'Review') / path.name
+                destination = (output/decision.vis if decision.vis else paths.unresolved) / path.name
                 # Durable intent precedes the move: an interruption cannot erase the page's mapping.
                 with (reports / 'transfers.jsonl').open('a', encoding='utf-8') as journal:
                     journal.write(json.dumps({'source': str(path), 'destination': str(destination),
@@ -426,7 +436,8 @@ def run(args) -> int:
         summary('COMPLETED_WITH_ERRORS' if errors else 'COMPLETED')
         logger.info('Folder FINISHED | duration=%.3fs | recovered=%d | review=%d | cache hits=%d',
                     time.perf_counter() - started, recovered, review, hits)
-        print(f'Finished | VIS={recovered} | Review={review} | cache hits={hits} | reports={reports}', flush=True)
+        print(f'Finished | VIS={recovered} | {paths.unresolved.name}={review} | '
+              f'cache hits={hits} | reports={reports}', flush=True)
         return 1 if errors else 0
     except BaseException as exc:
         logger.error('Folder stopped: %s', exc or type(exc).__name__)
@@ -439,8 +450,9 @@ def run(args) -> int:
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('-d', '--directory', required=True, type=Path, help='Folder containing single-page PDFs directly')
-    parser.add_argument('-o', '--output', type=Path, help='Existing VIS destination root; defaults to input parent')
+    parser.add_argument('-d', '--directory', required=True, type=Path, help='Parent root containing OCR')
+    parser.add_argument('-o', '--output', type=Path, help='Override VIS destination; defaults to parent/Output')
+    parser.add_argument('--legacy-layout', action='store_true', help='Use the old direct-input folder layout')
     parser.add_argument('--database', type=Path)
     parser.add_argument('--cache', type=Path, help='Persistent raw OCR SQLite cache')
     parser.add_argument('--copy', action='store_true', help='Keep original PDFs instead of moving them')

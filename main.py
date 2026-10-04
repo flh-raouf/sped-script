@@ -20,6 +20,7 @@ ACTIONS = {
     "Barcode extraction": "script.py",
     "Split and classify pages by VIS": "classify_pages.py",
     "Recover pages with OCR (PP-OCRv6 tiny)": "ocr_pages.py",
+    "Classify remaining pages (parts tables and sparse backs)": "review_pages.py",
     RECONSTRUCTION_ACTION: None,
     "Clean hidden files": "clean_hidden_files.py",
     "Split PDFs into individual pages (éclatement)": "split_pages.py",
@@ -67,11 +68,13 @@ def build_command(
             command.extend(["--excel", str(excel)])
         if script == "classify_pages.py" and database is not None:
             command.extend(["--database", str(database)])
-    elif script == "ocr_pages.py":
+    elif script in {"ocr_pages.py", "review_pages.py"}:
         if database is not None:
             command.extend(["--database", str(database)])
         if output is not None:
             command.extend(["--output", str(output)])
+        if script == "review_pages.py" and dry_run:
+            command.append("--dry-run")
     elif script == "clean_hidden_files.py" and dry_run:
         command.append("--dry-run")
     return command
@@ -164,13 +167,9 @@ def main() -> int:
                         choices=[path.name for path in workbooks],
                     ).execute()
                     excel = directory / selected
-            elif script == "ocr_pages.py":
-                output_text = inquirer.filepath(
-                    message="Root containing the VIS folders:", default=str(directory.parent),
-                    only_directories=True, validate=valid_directory,
-                    invalid_message="Enter an existing destination folder.",
-                ).execute()
-                output = normalize_directory(output_text)
+            elif script in {"ocr_pages.py", "review_pages.py"}:
+                input_name = 'OCR' if script == 'ocr_pages.py' else 'Pending'
+                print(f"Input: {directory / input_name}\nVIS folders: {directory / 'Output'}", flush=True)
             elif script == "clean_hidden_files.py":
                 mode = inquirer.select(
                     message="Cleaning mode:",
