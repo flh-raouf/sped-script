@@ -36,11 +36,11 @@ def rotated(line, turns):
     return ocr.TextLine(line.text, line.score, (min(xs), min(ys), max(xs), max(ys)))
 
 
-def table_badge(lines, lookup, min_score=.9):
+def table_candidates(lines, min_score=.9):
     """Recognize the parts checklist layout, never a bare badge in an arbitrary table.
 
     Require >=3 aligned ten-digit part references, paired OK/NOK cells to their
-    right, a ten-character reference above them and exactly one badge above it.
+    right and badge candidates in the header above them. A reference is optional.
     Try all four orientations using cached boxes; no new rotated OCR is needed.
     """
     usable = [line for line in lines if line.score >= min_score]
@@ -51,8 +51,6 @@ def table_badge(lines, lookup, min_score=.9):
         parts = [line for line in oriented if re.fullmatch(r'[0-9]{10}', line.text.strip())
                  and line.box[2] - line.box[0] > line.box[3] - line.box[1]]
         statuses = [line for line in oriented if ocr.folded(line.text).strip() in {'OK', 'NOK'}]
-        references = [line for line in oriented if re.fullmatch(r'[0-9]{8}[A-Z][0-9]',
-                                                              ocr.folded(line.text).strip())]
         badges = [line for line in oriented if re.fullmatch(r'[0-9]{5,6}', line.text.strip())]
         for anchor in parts:
             height = max(anchor.box[3] - anchor.box[1], 1)
@@ -64,16 +62,19 @@ def table_badge(lines, lookup, min_score=.9):
             if len(aligned) < 3:
                 continue
             top = min(part.box[1] for part in aligned)
-            for reference in references:
-                if not (0 < top - reference.box[3] < 6 * height):
-                    continue
-                candidates = [badge for badge in badges
-                              if 0 < reference.box[1] - badge.box[3] < 6 * height
-                              and abs((reference.box[0] + reference.box[2]) / 2
-                                      - (badge.box[0] + badge.box[2]) / 2) < 2 * height]
-                if candidates:
-                    recognized = True
-                    found.update(line.text.strip() for line in candidates)
+            left = min(part.box[0] for part in aligned)
+            right = max(status.box[2] for status in statuses)
+            candidates = [badge for badge in badges
+                          if 0 < top - badge.box[3] < 10 * height
+                          and left <= (badge.box[0] + badge.box[2]) / 2 <= right]
+            if candidates:
+                recognized = True
+                found.update(line.text.strip() for line in candidates)
+    return recognized, found
+
+
+def table_badge(lines, lookup, min_score=.9):
+    recognized, found = table_candidates(lines, min_score)
     if not recognized:
         return ocr.Decision(None, 'NOT_PARTS_TABLE')
     if len(found) != 1:
@@ -83,10 +84,80 @@ def table_badge(lines, lookup, min_score=.9):
     if len(choices) != 1:
         return ocr.Decision(None, 'UNKNOWN_TABLE_BADGE' if not choices else 'AMBIGUOUS_TABLE_BADGE')
     vis = next(iter(choices))
-    general = ocr.resolve_text(lines, lookup)
+    general = resolve_review_text(lines, lookup, table_badges=found)
     if general.reason == 'IDENTIFIER_CONFLICT' or (general.vis and general.vis != vis):
         return ocr.Decision(None, 'IDENTIFIER_CONFLICT')
     return ocr.Decision(vis, 'TABLE_BADGE', badges=(badge,))
+
+
+def contextual_badge(line, usable):
+    """Accept identifier fields and vehicle headers, never arbitrary table cells."""
+    text = ocr.folded(line.text)
+    if re.search(r'\b(?:BDG|BADGE|IDENTIFI[A-Z]*)\b', text):
+        return True
+    if not re.fullmatch(r"[\s'*]*[0-9]{5,6}[\s'*]*", text):
+        return False
+    for turns in range(4):
+        value = rotated(line, turns)
+        oriented = [rotated(item, turns) for item in usable]
+        for label in oriented:
+            if not re.search(r'\b(?:BDG|BADGE|IDENTIFI[A-Z]*)\b', ocr.folded(label.text)):
+                continue
+            x0, y0, x1, y1 = label.box
+            if x1-x0 < y1-y0:
+                continue
+            a0, b0, a1, b1 = value.box
+            h = max(y1-y0, b1-b0, 1)
+            if a0 >= x1-h*.3 and a0-x1 <= h*6 and abs((b0+b1-y0-y1)/2) <= h*.7:
+                return True
+        # A bare badge below the barcode in a VIN/Sequence vehicle header.
+        vins = [item for item in oriented if re.search(r'VIN\b', ocr.folded(item.text))
+                and item.box[2]-item.box[0] > item.box[3]-item.box[1]]
+        seqs = [item for item in oriented if re.search(r'\b(?:SEQ|SEQUENCE)\b', ocr.folded(item.text))]
+        for vin in vins:
+            x0,y0,x1,y1 = vin.box
+            h = max(y1-y0, 1)
+            a0,b0,a1,b1 = value.box
+            if (a0 > x1 and a0-x1 < h*30 and y0-h <= b0 <= y1+2*h
+                    and any(0 < y0-seq.box[1] < h*6 and abs(seq.box[0]-x0) < h*4 for seq in seqs)):
+                return True
+    return False
+
+
+def resolve_review_text(lines, lookup, min_score=.8, table_badges=None):
+    """Intersect every BDD match from an identifier context; ignore measurement cells."""
+    usable = [item for item in lines if item.score >= min_score]
+    if table_badges is None:
+        _, table_badges = table_candidates(lines)
+    operators = [item for item in usable if re.search(r'BADGE\s+OPERAT(?:EUR|OR)', ocr.folded(item.text))]
+    seq_labels = [item for item in usable if re.search(r'\b(?:SEQ|SEQUENCE)\b', ocr.folded(item.text))]
+    matches, badges, vins, seqs = [], set(), set(), set()
+    for item in usable:
+        text = ocr.folded(item.text)
+        for vis in ocr.VIS_PATTERN.findall(text):
+            if vis in lookup.database.records_by_vis:
+                matches.append({vis})
+        for vin in ocr.VIN_PATTERN.findall(text):
+            if vin in lookup.vins:
+                matches.append(set(lookup.vins[vin])); vins.add(vin)
+        if not any(ocr.near(label,item) for label in operators):
+            for badge in ocr.BADGE_PATTERN.findall(text):
+                if badge in lookup.badges and (contextual_badge(item,usable)
+                                               or badge in table_badges and item.score >= .9):
+                    matches.append(set(lookup.badges[badge])); badges.add(badge)
+        for match in ocr.SEQ_PATTERN.finditer(text):
+            seq = re.sub(r'\s','',match.group())
+            if seq in lookup.sequences and any(ocr.near(label,item) for label in seq_labels):
+                matches.append(set(lookup.sequences[seq])); seqs.add(seq)
+    if not matches:
+        return ocr.Decision(None,'NO_RELIABLE_IDENTIFIER')
+    choices = set.intersection(*matches)
+    if not choices:
+        return ocr.Decision(None,'IDENTIFIER_CONFLICT')
+    if len(choices) != 1:
+        return ocr.Decision(None,'AMBIGUOUS_IDENTIFIER')
+    return ocr.Decision(next(iter(choices)), 'BDD_MATCH', tuple(sorted(badges)),
+                        tuple(sorted(vins)), tuple(sorted(seqs)))
 
 
 def pixel_ink_percent(pixels, threshold=128, crop_percent=2):
@@ -135,8 +206,7 @@ def contradicts(lines, vis, lookup, min_score):
         for match in ocr.VIN_PATTERN.finditer(text):
             if match.group()[-8:] != vis:
                 return True
-        for pattern, index in ((ocr.BADGE_PATTERN, lookup.badges),
-                               (ocr.VIN_PATTERN, lookup.vins)):
+        for pattern, index in ((ocr.VIN_PATTERN, lookup.vins),):
             for match in pattern.finditer(text):
                 choices = index.get(match.group())
                 if choices and vis not in choices:
@@ -145,7 +215,8 @@ def contradicts(lines, vis, lookup, min_score):
             choices = lookup.sequences.get(re.sub(r'\s', '', match.group()))
             if choices and vis not in choices:
                 return True
-    return ocr.resolve_text(lines, lookup, min_score).reason == 'IDENTIFIER_CONFLICT'
+    general = resolve_review_text(lines, lookup, min_score)
+    return general.reason == 'IDENTIFIER_CONFLICT' or bool(general.vis and general.vis != vis)
 
 
 def read_metadata(output, reports=None):
@@ -204,6 +275,12 @@ def independent_pages(output, metadata, needed_keys=None, provenance=None):
 
 def decide(name, lines, density, lookup, predecessors, max_ink=.9, min_score=.9):
     table = table_badge(lines, lookup, min_score)
+    # A BDD match identifies the page itself, regardless of ink or predecessor.
+    general = resolve_review_text(lines, lookup)
+    if general.reason != 'NO_RELIABLE_IDENTIFIER':
+        if table.vis and general.vis == table.vis:
+            return table, ''
+        return general, ''
     if table.reason != 'NOT_PARTS_TABLE':
         return table, ''
     if density > max_ink:

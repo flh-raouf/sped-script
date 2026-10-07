@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -25,6 +26,20 @@ def database():
     other = classify.VehicleRecord('91069', 'BRYEKNFJ5S5780509', 'S5780509', 'SEQEMON0118300182', '', 2026)
     return classify.DatabaseIndex({'91034': frozenset({VIS}), '91069': frozenset({'S5780509'})},
                                   {VIS: [record], 'S5780509': [other]})
+
+
+class EngineTests(unittest.TestCase):
+    def test_cpu_engine_avoids_unsupported_onednn_backend(self):
+        def create_model(**options):
+            if options.get('enable_mkldnn', True):
+                raise NotImplementedError('ConvertPirAttribute2RuntimeAttribute not support DoubleAttribute')
+            return object()
+
+        module = types.ModuleType('paddleocr')
+        module.PaddleOCR = create_model
+        with patch.dict('sys.modules', {'paddleocr': module}):
+            engine = ocr.PaddleEngine(200, 'cpu')
+        self.assertIsNotNone(engine.model)
 
 
 class CacheTests(unittest.TestCase):

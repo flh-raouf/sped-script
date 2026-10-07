@@ -114,9 +114,10 @@ class PaddleEngine:
     def __init__(self, dpi: int, device: str):
         from paddleocr import PaddleOCR
         self.dpi = dpi
+        # Paddle 3.3.x oneDNN can fail converting PIR DoubleAttribute arrays.
         self.model = PaddleOCR(text_detection_model_name=DET_MODEL, text_recognition_model_name=REC_MODEL,
                                use_doc_orientation_classify=False, use_doc_unwarping=False,
-                               use_textline_orientation=False, device=device,
+                               use_textline_orientation=False, device=device, enable_mkldnn=False,
                                text_det_limit_side_len=1600, text_det_limit_type='max')
 
     def read(self, path: Path) -> list[TextLine]:

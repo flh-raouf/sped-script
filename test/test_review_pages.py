@@ -62,8 +62,7 @@ class ReviewRulesTests(unittest.TestCase):
 
     def test_arbitrary_badge_and_other_checklist_do_not_become_parts_tables(self):
         for lines in ([line('91034')], [line('CHECK-LIST DES DEFAUTS'), line('91034')],
-                      [item for item in parts_table() if item.text != 'OK'],
-                      [item for item in parts_table() if item.text != '98749524F4']):
+                      [item for item in parts_table() if item.text != 'OK']):
             self.assertIsNone(review.table_badge(lines, self.lookup).vis)
 
     def test_unknown_ambiguous_low_confidence_and_conflicting_table(self):
@@ -79,15 +78,61 @@ class ReviewRulesTests(unittest.TestCase):
                          'IDENTIFIER_CONFLICT')
 
     def test_sparse_inheritance_exact_predecessor_and_conflict_guards(self):
-        decision, name = review.decide('1_25', [line('Identifiant G028 / 91034')], .2,
+        decision, name = review.decide('1_25', [], .2,
                                       self.lookup, self.previous)
         self.assertEqual((decision.vis, decision.reason, name), (VIS, 'PREVIOUS_PAGE', '1_24'))
         for name in ('2_25', '1_26', 'bad-name'):
             self.assertIsNone(review.decide(name, [], .1, self.lookup, self.previous)[0].vis)
-        for lines in ([line('91069')], [line('VIS S5780509')], [line('SEQ 126183182')]):
+        for lines in ([line('Identifiant G028 / 91034'), line('BDG 91069')],
+                      [line('VIS '+VIS), line('VIS S5780509')],
+                      [line('SEQ 126183161'), line('SEQ 126183182')]):
             self.assertEqual(review.decide('1_25', lines, .1, self.lookup, self.previous)[0].reason,
                              'IDENTIFIER_CONFLICT')
         self.assertIsNone(review.decide('1_25', [], 1, self.lookup, self.previous)[0].vis)
+
+    def test_bdd_badge_classifies_dense_page_without_table_or_predecessor(self):
+        for name, density, text in (('1_373', .912481, 'Identifiant G028 / 91034'),
+                                    ('2_443', 3.715422, 'Identifiant G028 / 91034')):
+            decision, previous = review.decide(name, [line(text), line('BRYEKNFJ1T6704898')],
+                                               density, self.lookup, {})
+            self.assertEqual((decision.vis, decision.reason, previous), (VIS, 'BDD_MATCH', ''))
+
+    def test_optional_reference_and_alternative_reference_do_not_cancel_badge(self):
+        for reference in ('98749524PR', None):
+            lines = [item for item in parts_table() if item.text != '98749524F4']
+            if reference:
+                lines.append(line(reference, (50, 60, 250, 80)))
+            for turns in range(4):
+                decision, _ = review.decide('1_52', [review.rotated(item,turns) for item in lines],
+                                            5, self.lookup, {})
+                self.assertEqual((decision.vis, decision.reason), (VIS,'TABLE_BADGE'))
+
+    def test_measurements_do_not_conflict_with_identifier_or_classify_alone(self):
+        data = database()
+        data.badge_vis['12060'] = frozenset({'S5780509'})
+        lookup = ocr.Lookup(data)
+        lines = [line('Identifiant G024 / 91034', (10,10,300,30)),
+                 line('Couple Angle', (10,100,200,120)), line('12060',(10,150,100,170))]
+        for turns in range(4):
+            decision = review.resolve_review_text([review.rotated(item,turns) for item in lines],lookup)
+            self.assertEqual((decision.vis,decision.badges),(VIS,('91034',)))
+        self.assertIsNone(review.resolve_review_text([lines[-1]],lookup).vis)
+        self.assertEqual(review.resolve_review_text(lines+[line('Identifiant G028 / 12060')],lookup).reason,
+                         'IDENTIFIER_CONFLICT')
+
+    def test_vehicle_header_retains_badge_conflicts_and_needs_header_context(self):
+        lines = [line('Sequence:', (10,10,150,30)), line('126183161',(10,40,200,60)),
+                 line('NVIN: BRYEKNFJ1T5704898',(10,80,400,110)),
+                 line('91069*',(500,120,590,140))]
+        self.assertEqual(review.resolve_review_text(lines,self.lookup).reason,'IDENTIFIER_CONFLICT')
+        lines[3] = line('91034*',lines[3].box)
+        self.assertEqual(review.resolve_review_text(lines,self.lookup).vis,VIS)
+        self.assertIsNone(review.resolve_review_text([lines[3]],self.lookup).vis)
+
+    def test_unknown_table_badge_does_not_cancel_valid_vin(self):
+        decision,_ = review.decide('1_52',parts_table('99999')+[line('BRYEKNFJ1T5704898')],
+                                   5,self.lookup,{})
+        self.assertEqual(decision.vis,VIS)
 
     def test_table_rule_precedes_sparse_rule(self):
         decision, _ = review.decide('1_25', parts_table('91069'), .1, self.lookup, self.previous)

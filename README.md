@@ -298,6 +298,9 @@ OCR uses `PP-OCRv6_tiny_det` and `PP-OCRv6_tiny_rec`, on CPU by default,
 with full-page rendering at 200 DPI. Optional `--dpi` and `--device` change
 these settings. Paddle downloads the two models on first use and reuses its
 local model cache afterwards. Internet access is needed for that first download.
+MKL-DNN (oneDNN) acceleration is disabled to avoid Paddle's
+`ConvertPirAttribute2RuntimeAttribute` / `DoubleAttribute` inference failure.
+This workaround also applies to the review stage, which shares the OCR engine.
 
 The BDD is indexed once in memory by full VIN, VIS, badge, and sequence, rather than
 scanning all Excel rows for every page. A recognised 17-character VIN must
@@ -373,13 +376,24 @@ python scripts/review_pages.py -d "/path/to/Parent" --cache-only --dry-run
 ```
 
 The script first recognizes the parts-table layout: at least three aligned
-ten-digit part references paired with OK/NOK cells, a reference such as
-`98749524F4` above them, and a single badge in the first row. It uses cached text,
+ten-digit part references paired with OK/NOK cells and a single badge in the
+header above them. A reference such as `98749524F4` or `98749524PR` is optional. It uses cached text,
 confidence scores and coordinates in all four orientations. The badge must map
 to exactly one VIS in the BDD. A random five-digit number or a different kind
 of table does not satisfy this rule. Default minimum confidence is 0.9.
 
-Other pages can inherit the exact preceding page's VIS within the same lot only
+Other pages use a Review-specific BDD lookup. Badges may be accepted without
+`BDG` when they occur in an `Identifiant` field, next to an identifier label,
+or in the badge area of a VIN/Sequence vehicle header. Arbitrary numeric cells
+(such as torque measurements) cannot identify a page merely by matching the BDD.
+Full VIN/VIS values and labelled sequences also participate in this lookup.
+All accepted identifiers must agree. A unique match classifies the page regardless
+of its ink coverage or preceding page; conflicting or ambiguous matches remain
+unresolved. A missing or unknown table reference does not cancel a badge identified
+through another supported context. These additional rules apply only to Review;
+the OCR stage retains its label/corroboration requirements.
+
+Pages without a BDD identifier can inherit the exact preceding page's VIS within the same lot only
 if their dark-pixel coverage is at most 0.9%, their predecessor was independently
 classified and their OCR contains no conflicting identifier. Coverage is
 measured at 100 DPI with grayscale values below 128, after excluding 2% from
