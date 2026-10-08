@@ -32,15 +32,16 @@ activated. On Windows use `python main.py`.
 The launcher stays at the project root. All processing utilities and their
 shared reconstruction code live in `scripts/`; tests live in `test/`.
 
-Select extraction, OCR recovery, document reconstruction, hidden-file cleaning, or page
-splitting with the arrow keys and Enter. Reconstruction then asks whether to
-use identified pages only or local ranges. Enter the root folder (the last
-folder is remembered for this session). Extraction asks for workers and, when
-needed, the source workbook. Cleaning defaults to a dry-run preview; choose
-deletion explicitly to remove files. Progress is displayed live, and you
-return to the menu when finished. Ctrl+C cancels a prompt or interrupts an
-operation. The launcher uses the same Python environment as the processing
-scripts.
+Select **Extraction des codes-barres**, **Extraction par OCR (PP-OCRv6 tiny)**,
+**Classification finale (tableaux de pièces et versos peu renseignés)**, or
+**Opérations complémentaires** with the arrow keys and Enter. The latter opens
+the hidden-file cleanup and PDF page-splitting options. Enter the root folder
+(the last folder is remembered for this session). Barcode extraction asks for
+workers and, when needed, the source workbook. Cleaning defaults to a dry-run
+preview; choose deletion explicitly to remove files. Progress is displayed
+live, and you return to the menu when finished. Ctrl+C cancels a prompt or
+interrupts an operation. The launcher uses the same Python environment as the
+processing scripts.
 
 You can also run each script directly:
 
@@ -135,9 +136,9 @@ Use `--dry-run` first to list eligible files without deleting anything.
 
 Use the same parent path for all three menu actions, in this order:
 
-1. **Split and classify pages by VIS**: numbered lots → `Output/<VIS>/` or `OCR/`.
-2. **Recover pages with OCR (PP-OCRv6 tiny)**: `OCR/` → `Output/<VIS>/` or `Pending/`.
-3. **Classify remaining pages (parts tables and sparse backs)**: `Pending/` → `Output/<VIS>/` or final `Review/`.
+1. **Extraction des codes-barres**: numbered lots → `Output/<VIS>/` or `OCR/`.
+2. **Extraction par OCR (PP-OCRv6 tiny)**: `OCR/` → `Output/<VIS>/` or `Pending/`.
+3. **Classification finale (tableaux de pièces et versos peu renseignés)**: `Pending/` → `Output/<VIS>/` or final `Review/`.
 
 ```text
 Parent/
@@ -176,9 +177,9 @@ remaining-page scripts take the direct PDF folder and default VIS destination
 as before. No existing files are migrated automatically. An old cache can also
 be explicitly selected using `--cache`.
 
-## Split and classify pages by VIS
+## Extraction des codes-barres
 
-Select **Split and classify pages by VIS** in `python main.py`, or run:
+Select **Extraction des codes-barres** in `python main.py`, or run:
 
 ```bash
 python scripts/classify_pages.py -d "/path/to/batch" -n 8
@@ -361,9 +362,9 @@ The implementation has been exercised on macOS; Windows execution has not been
 tested here. It does not update the earlier barcode reports or search-list
 highlighting: its own OCR reports record the recovered pages.
 
-## Classify remaining pages
+## Classification finale (tableaux de pièces et versos peu renseignés)
 
-The menu action **Classify remaining pages (parts tables and sparse backs)** runs
+The menu action **Classification finale (tableaux de pièces et versos peu renseignés)** runs
 `scripts/review_pages.py`. Supply the same parent root; it reads immediate PDFs
 from `Pending/`, sends identified pages to `Output/<VIS>/`, and moves unresolved
 pages to the sibling final `Review/`. BDD discovery, tiny models and the OCR

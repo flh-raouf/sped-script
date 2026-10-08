@@ -11,23 +11,22 @@ from scripts.classify_pages import discover_database
 from scripts.script import ConfigurationError
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent / "scripts"
-RECONSTRUCTION_ACTION = "Document reconstruction"
-RECONSTRUCTION_MODES = {
-    "Identified pages only": "reconstruct_identified.py",
-    "Local ranges": "reconstruct_ranges.py",
-}
+ADDITIONAL_ACTION = "Opérations complémentaires"
+EXIT_ACTION = "Quitter"
 ACTIONS = {
-    "Barcode extraction": "script.py",
-    "Split and classify pages by VIS": "classify_pages.py",
-    "Recover pages with OCR (PP-OCRv6 tiny)": "ocr_pages.py",
-    "Classify remaining pages (parts tables and sparse backs)": "review_pages.py",
-    RECONSTRUCTION_ACTION: None,
-    "Clean hidden files": "clean_hidden_files.py",
-    "Split PDFs into individual pages (éclatement)": "split_pages.py",
+    "Extraction des codes-barres": "classify_pages.py",
+    "Extraction par OCR (PP-OCRv6 tiny)": "ocr_pages.py",
+    "Classification finale (tableaux de pièces et versos peu renseignés)": "review_pages.py",
+    ADDITIONAL_ACTION: None,
+}
+ADDITIONAL_ACTIONS = {
+    "Nettoyage des fichiers cachés": "clean_hidden_files.py",
+    "Éclatement des PDF en pages individuelles": "split_pages.py",
 }
 SUPPORTED_SCRIPTS = {
-    *(script for script in ACTIONS.values() if script is not None),
-    *RECONSTRUCTION_MODES.values(),
+    script
+    for script in [*ACTIONS.values(), *ADDITIONAL_ACTIONS.values()]
+    if script is not None
 }
 
 
@@ -36,7 +35,7 @@ def normalize_directory(value: str) -> Path:
     if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
         text = text[1:-1]
     if not text:
-        raise ValueError("Enter a folder path.")
+        raise ValueError("Saisissez le chemin d'un dossier.")
     return Path(text).expanduser().resolve()
 
 
@@ -60,7 +59,7 @@ def build_command(
         raise ValueError(f"Unknown operation: {script}")
     command = [sys.executable, "-u", str(SCRIPT_DIRECTORY / script),
                "-d", str(directory)]
-    if script in {"script.py", "classify_pages.py"}:
+    if script == "classify_pages.py":
         if workers <= 0:
             raise ValueError("Workers must be greater than zero.")
         command.extend(["-n", str(workers)])
@@ -98,7 +97,8 @@ def execute_command(command: list[str]) -> int:
 
 def main() -> int:
     try:
-        from InquirerPy import inquirer
+        from InquirerPy import get_style, inquirer
+        from InquirerPy.prompts.list import InquirerPyListControl
     except ImportError:
         print('Install the menu dependency with: python -m pip install "InquirerPy==0.3.4"',
               file=sys.stderr)
@@ -107,49 +107,87 @@ def main() -> int:
         print("Run python main.py in an interactive terminal.", file=sys.stderr)
         return 2
 
-    print("\nDocument processing\nUse arrow keys and Enter. Ctrl+C cancels a prompt.\n")
+    class MainMenuListControl(InquirerPyListControl):
+        def _color_exit_choice(self, choice, display_choices):
+            if choice["value"] == EXIT_ACTION:
+                display_choices[-1] = ("class:exit-choice", choice["name"])
+            return display_choices
+
+        def _get_normal_text(self, choice):
+            return self._color_exit_choice(choice, super()._get_normal_text(choice))
+
+        def _get_hover_text(self, choice):
+            return self._color_exit_choice(choice, super()._get_hover_text(choice))
+
+    menu_style = get_style({"exit-choice": "red"}, style_override=False)
+
+    def select_main_action():
+        prompt = inquirer.select(
+            message="Que souhaitez-vous faire ?",
+            choices=[*ACTIONS, EXIT_ACTION],
+            style=menu_style,
+        )
+        original_control = prompt.content_control
+        colored_control = MainMenuListControl(
+            choices=original_control.choices,
+            default=None,
+            pointer=original_control._pointer,
+            marker=original_control._marker,
+            session_result=original_control._session_result,
+            multiselect=original_control._multiselect,
+            marker_pl=original_control._marker_pl,
+        )
+        colored_control.selected_choice_index = original_control.selected_choice_index
+        prompt.content_control = colored_control
+        for window in prompt.application.layout.find_all_windows():
+            if window.content is original_control:
+                window.content = colored_control
+        return prompt.execute()
+
+    print("\nTraitement des documents\nUtilisez les flèches et Entrée. Ctrl+C annule une invite.\n")
     last_directory = ""
     while True:
         try:
-            action = inquirer.select(
-                message="What would you like to do?",
-                choices=[*ACTIONS, "Exit"],
-            ).execute()
+            action = select_main_action()
         except (KeyboardInterrupt, EOFError):
             return 0
-        if action == "Exit":
+        if action == EXIT_ACTION:
             return 0
         try:
-            script = ACTIONS[action]
-            display_action = action
-            if action == RECONSTRUCTION_ACTION:
-                reconstruction_mode = inquirer.select(
-                    message="Reconstruction method:",
-                    choices=[*RECONSTRUCTION_MODES, "Back to menu"],
-                ).execute()
-                if reconstruction_mode == "Back to menu":
+            if action == ADDITIONAL_ACTION:
+                try:
+                    additional_action = inquirer.select(
+                        message="Opération complémentaire :",
+                        choices=[*ADDITIONAL_ACTIONS, "Retour au menu"],
+                    ).execute()
+                except (KeyboardInterrupt, EOFError):
                     continue
-                script = RECONSTRUCTION_MODES[reconstruction_mode]
-                display_action = f"{action} — {reconstruction_mode}"
+                if additional_action == "Retour au menu":
+                    continue
+                script = ADDITIONAL_ACTIONS[additional_action]
+                display_action = additional_action
+            else:
+                script = ACTIONS[action]
+                display_action = action
             assert script is not None
             path_text = inquirer.filepath(
-                message="Root folder:", default=last_directory,
+                message="Dossier racine :", default=last_directory,
                 only_directories=True, validate=valid_directory,
-                invalid_message="Enter an existing folder path (quotes are optional).",
+                invalid_message="Saisissez le chemin d'un dossier existant (les guillemets sont facultatifs).",
             ).execute()
             directory = normalize_directory(path_text)
             last_directory = str(directory)
             workers, dry_run, excel, database = 1, False, None, None
             output = None
-            if script in {"script.py", "classify_pages.py"}:
+            if script == "classify_pages.py":
                 workers = int(inquirer.text(
-                    message="Number of workers:", default="1",
+                    message="Nombre de processus :", default="1",
                     validate=valid_workers,
-                    invalid_message="Enter a whole number greater than zero.",
+                    invalid_message="Saisissez un nombre entier supérieur à zéro.",
                 ).execute())
                 if script == "classify_pages.py":
                     database = discover_database(directory)
-                    print(f"BDD detected: {database.name}", flush=True)
+                    print(f"BDD détectée : {database.name}", flush=True)
                 workbooks = sorted(
                     path for path in directory.iterdir()
                     if path.is_file() and path.suffix.lower() in {".xlsx", ".xlsm"}
@@ -158,47 +196,42 @@ def main() -> int:
                     and path.resolve() != database
                 )
                 if not workbooks:
-                    print("No source Excel workbook found directly in this folder.\n")
+                    print("Aucun classeur Excel source trouvé directement dans ce dossier.\n")
                     continue
                 excel = workbooks[0]
                 if len(workbooks) > 1:
                     selected = inquirer.select(
-                        message="Source workbook:",
+                        message="Classeur source :",
                         choices=[path.name for path in workbooks],
                     ).execute()
                     excel = directory / selected
             elif script in {"ocr_pages.py", "review_pages.py"}:
                 input_name = 'OCR' if script == 'ocr_pages.py' else 'Pending'
-                print(f"Input: {directory / input_name}\nVIS folders: {directory / 'Output'}", flush=True)
+                print(f"Entrée : {directory / input_name}\nDossiers VIS : {directory / 'Output'}", flush=True)
             elif script == "clean_hidden_files.py":
                 mode = inquirer.select(
-                    message="Cleaning mode:",
-                    choices=["Dry run — preview files", "Delete eligible hidden files",
-                             "Back to menu"],
+                    message="Mode de nettoyage :",
+                    choices=["Simulation — prévisualiser les fichiers",
+                             "Supprimer les fichiers cachés concernés", "Retour au menu"],
                 ).execute()
-                if mode == "Back to menu":
+                if mode == "Retour au menu":
                     continue
-                dry_run = mode.startswith("Dry run")
-            elif script.startswith("reconstruct_"):
-                if not (directory / "results.csv").is_file():
-                    print("Missing results.csv directly inside this folder.\n")
-                    continue
-
+                dry_run = mode.startswith("Simulation")
             command = build_command(script, directory, workers=workers,
                                     dry_run=dry_run, excel=excel, database=database, output=output)
-            print(f"\n{display_action}\nFolder: {directory}\n", flush=True)
+            print(f"\n{display_action}\nDossier : {directory}\n", flush=True)
             code = execute_command(command)
             if code == 0:
-                print("\nCompleted successfully. Outputs, if any, are in the selected folder.")
+                print("\nOpération terminée. Les éventuels résultats se trouvent dans le dossier sélectionné.")
             elif code == 130:
-                print("\nOperation interrupted. Partial outputs may remain.")
+                print("\nOpération interrompue. Des résultats partiels peuvent subsister.")
             else:
-                print(f"\nOperation ended with errors (exit code {code}). See the messages above.")
-            inquirer.text(message="Press Enter to return to the menu:").execute()
+                print(f"\nL'opération s'est terminée avec des erreurs (code de sortie {code}). Consultez les messages ci-dessus.")
+            inquirer.text(message="Appuyez sur Entrée pour revenir au menu :").execute()
         except (KeyboardInterrupt, EOFError):
-            print("\nReturning to menu.\n")
+            print("\nRetour au menu.\n")
         except (OSError, ValueError, ConfigurationError) as exc:
-            print(f"\nCould not run operation: {exc}\n", file=sys.stderr)
+            print(f"\nImpossible d'exécuter l'opération : {exc}\n", file=sys.stderr)
 
 
 if __name__ == "__main__":
