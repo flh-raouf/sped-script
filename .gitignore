@@ -53,3 +53,5 @@ htmlcov/
 # Misc
 *.sqlite3
 .ipynb_checkpoints/
+# Local deployment settings
+config.toml

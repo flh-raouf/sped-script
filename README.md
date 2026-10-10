@@ -29,6 +29,47 @@ python main.py
 On macOS/Linux you can also use `./main.py` with your virtual environment
 activated. On Windows use `python main.py`.
 
+## One-click run (`run_all.py`)
+
+`run_all.py` replaces the manual routine. It copies the new lots from the scan
+destination into the permanent working root, then chains the three stages
+(barcodes, OCR, final classification) and prints a summary. Originals in the
+source folder are never moved or modified.
+
+One-time setup on the PC (inside WSL, in the project folder):
+
+```bash
+cp config.example.toml config.toml   # then set "source" and "racine" (WSL paths, e.g. /mnt/d/...)
+./creer_raccourci.sh                 # creates the "Traitement SPED" shortcut on the Windows Desktop
+```
+
+Daily use: double-click the shortcut, check the lots and estimated duration,
+press Enter. A summary is shown at the end and the `Review` folder is opened in
+Explorer. The same command works from a WSL terminal: `python run_all.py`
+(`--yes` skips the confirmation and the final pause, for a scheduled task).
+
+What it does, in order:
+
+1. Checks the folders, the BDD, the search list and the free disk space.
+2. Lists the new lots (numeric folders holding exactly one PDF, stable in size)
+   and asks for confirmation. A lot already imported is never copied again; if
+   its PDF changed in the source folder, the run stops without modifying anything.
+3. Copies each lot privately, verifies its size, then publishes it.
+4. Runs the barcode stage on the lots in the root, then moves each *published*
+   lot's working copy to `Archive/` (the stage cannot rescan a published lot).
+5. Runs OCR if `OCR/` holds pages, then the final classification if `Pending/`
+   holds pages. Resuming after an interruption needs no special step: whatever
+   remains in those folders is picked up by the next launch.
+
+Exit codes 0 and 1 of a stage (1 = warnings, e.g. pages sent to OCR) let the
+chain continue and appear in the summary. Any other code stops the run. Lots
+that fail the barcode stage stay in the root and are retried next time.
+Imported lots are recorded in `Reports/pipeline_state.json`, each run's summary
+is saved in `Reports/pipeline/`, and a second simultaneous run is refused.
+While running, Windows is kept from sleeping (best effort, via `powershell.exe`).
+
+Tests: `PYTHONPATH=. python -m unittest discover -s test`.
+
 The launcher stays at the project root. All processing utilities and their
 shared reconstruction code live in `scripts/`; tests live in `test/`.
 

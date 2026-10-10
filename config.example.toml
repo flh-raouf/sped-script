@@ -1,0 +1,24 @@
+# Copiez ce fichier vers config.toml (non versionné) et adaptez les chemins.
+# Les chemins sont ceux vus depuis WSL : /mnt/d/... pour le disque D:.
+
+[dossiers]
+# Lots finalisés, déposés par le service de scan. Jamais modifié : on y copie seulement.
+source = "/mnt/d/Scansped Destination"
+# Racine de travail permanente : lots copiés, Output/, OCR/, Pending/, Review/,
+# Reports/, Archive/, ainsi que la BDD et la liste de recherche Excel.
+racine = "/mnt/d/Capture sped"
+
+[traitement]
+# Nombre de processus pour l'extraction des codes-barres.
+processus = 4
+# Secondes pendant lesquelles la taille d'un lot doit rester stable avant import.
+# attente_stabilite = 5
+# À renseigner seulement si la racine contient plusieurs classeurs Excel.
+# bdd = "BDD_2024_2025_2026.xlsx"
+# liste = "dirty list.xlsx"
+
+# Valeurs servant uniquement à estimer la durée affichée avant le lancement.
+# [estimation]
+# codes_barres = 0.5   # secondes par page
+# ocr = 3.5            # secondes par page
+# part_ocr = 0.5       # part des pages qui passent par l'OCR
