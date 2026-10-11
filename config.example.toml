@@ -3,16 +3,19 @@
 
 [dossiers]
 # Lots finalisés, déposés par le service de scan. Jamais modifié : on y copie seulement.
-source = "/mnt/d/Scansped Destination"
+source = "/mnt/d/SCAN SPED DESTINATION"
 # Racine de travail permanente : lots copiés, Output/, OCR/, Pending/, Review/,
 # Reports/, Archive/, ainsi que la BDD et la liste de recherche Excel.
-racine = "/mnt/d/Capture sped"
+racine = "/mnt/d/CAPTURESPED"
 
 [traitement]
 # Nombre de processus pour l'extraction des codes-barres.
-processus = 4
+processus = 6
 # Secondes pendant lesquelles la taille d'un lot doit rester stable avant import.
 # attente_stabilite = 5
+# Lots déjà traités avant l'utilisation de ce raccourci : ils apparaissent en vert
+# dans la liste et ne peuvent plus être sélectionnés. Plages séparées par des virgules.
+# deja_traites = "1-82, 200-472"
 # À renseigner seulement si la racine contient plusieurs classeurs Excel.
 # bdd = "BDD_2024_2025_2026.xlsx"
 # liste = "dirty list.xlsx"

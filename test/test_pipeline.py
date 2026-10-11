@@ -8,6 +8,7 @@ from pathlib import Path
 from test_split_pages import make_pdf
 
 from scripts import pipeline
+from scripts.lot_catalog import Status
 from scripts.pipeline import (ARCHIVE, BARCODE_SCRIPT, OCR_SCRIPT, REVIEW_SCRIPT, Config,
                               PipelineError, Registry)
 
@@ -54,10 +55,13 @@ class PipelineTestCase(unittest.TestCase):
         self.config = Config(source=self.source, root=self.root, workers=2, stable_seconds=0)
         self.registry = Registry(pipeline.registry_path(self.config))
 
-    def plan(self, **kwargs):
+    def plan(self, lots=None, **kwargs):
+        """Plan for ``lots``, or for every new lot of the source folder."""
         kwargs.setdefault("sleep", lambda seconds: None)
         kwargs.setdefault("pages_of", lambda pdf: 10)
-        return pipeline.build_plan(self.config, self.registry, **kwargs)
+        if lots is None:
+            lots = pipeline.new_lots(pipeline.build_catalog(self.config, self.registry))
+        return pipeline.build_plan(self.config, self.registry, lots, **kwargs)
 
 
 class ConfigTests(unittest.TestCase):
@@ -74,6 +78,16 @@ class ConfigTests(unittest.TestCase):
             '[estimation]\nocr = 2\n'))
         self.assertEqual((config.source, config.root, config.workers), (Path("/a"), Path("/b"), 8))
         self.assertEqual((config.search_list, config.database, config.ocr_seconds_per_page), ("dirty.xlsx", None, 2.0))
+        self.assertEqual(config.already_done, ())
+
+    def test_lots_processed_before_the_registry_are_declared_as_ranges(self):
+        config = pipeline.load_config(self.write(
+            '[dossiers]\nsource = "/a"\nracine = "/b"\n[traitement]\ndeja_traites = "1-82, 200-472"\n'))
+        self.assertEqual(config.already_done, ((1, 82), (200, 472)))
+        for bad in ('"1-"', "12"):
+            with self.assertRaisesRegex(PipelineError, "deja_traites"):
+                pipeline.load_config(self.write(
+                    f'[dossiers]\nsource = "/a"\nracine = "/b"\n[traitement]\ndeja_traites = {bad}\n'))
 
     def test_missing_file_explains_how_to_create_it(self):
         with self.assertRaisesRegex(PipelineError, "config.example.toml"):
@@ -145,25 +159,70 @@ class PreflightTests(PipelineTestCase):
             pass
 
 
+class CatalogTests(PipelineTestCase):
+    def statuses(self):
+        return {lot.name: lot.status for lot in pipeline.build_catalog(self.config, self.registry)}
+
+    def test_lists_every_source_lot_highest_first_with_its_status(self):
+        for name in ("9", "10", "11", "12", "13", "14", "notes"):
+            (self.source / name).mkdir()
+        self.registry.record_import("9", "scan.pdf", 1)
+        self.registry.mark_scanned("9")
+        (self.root / ARCHIVE / "10").mkdir(parents=True)
+        (self.root / "11").mkdir()
+        self.registry.record_import("12", "scan.pdf", 1)       # copied, then the root lost it
+        catalog = pipeline.build_catalog(self.config, self.registry)
+        self.assertEqual([lot.name for lot in catalog], ["14", "13", "12", "11", "10", "9"])
+        new, progress, done = Status.NEW, Status.IN_PROGRESS, Status.DONE
+        self.assertEqual([lot.status for lot in catalog], [new, new, new, progress, done, done])
+
+    def test_lots_declared_in_the_config_are_done(self):
+        for name in ("82", "83", "300"):
+            (self.source / name).mkdir()
+        self.config = Config(source=self.source, root=self.root, already_done=((1, 82), (200, 472)))
+        self.assertEqual(self.statuses(), {"300": Status.DONE, "83": Status.NEW, "82": Status.DONE})
+
+    def test_does_not_open_any_pdf(self):
+        write_lot(self.source, "1", b"not even a pdf")
+        self.assertEqual(self.statuses(), {"1": Status.NEW})
+        self.assertEqual(pipeline.new_lots(pipeline.build_catalog(self.config, self.registry)), ["1"])
+
+    def test_gap_warning_names_the_forgotten_lots(self):
+        for name in ("610", "611", "612", "613"):
+            (self.source / name).mkdir()
+        self.registry.record_import("610", "scan.pdf", 1)
+        self.registry.mark_scanned("610")
+        catalog = pipeline.build_catalog(self.config, self.registry)
+        self.assertIn("le lot 611 n'est pas traité", pipeline.format_gaps(catalog, ["612"]))
+        self.assertIsNone(pipeline.format_gaps(catalog, ["611", "612"]))
+        self.assertIsNone(pipeline.format_gaps(catalog, []))
+
+
 class PlanTests(PipelineTestCase):
-    def test_new_lots_are_planned_in_numeric_order(self):
-        for name in ("10", "9", "notes"):
+    def test_chosen_lots_are_planned_in_numeric_order(self):
+        for name in ("10", "9"):
             write_lot(self.source, name)
-        plan = self.plan()
+        plan = self.plan(["10", "9"])
         self.assertEqual([lot.name for lot in plan.incoming], ["9", "10"])
         self.assertEqual(plan.scan_pages, 20)
         self.assertFalse(plan.idle)
 
-    def test_known_lots_are_not_imported_again(self):
+    def test_only_chosen_lots_are_opened(self):
+        for name in ("1", "2", "3"):
+            write_lot(self.source, name)
+        opened = []
+        plan = self.plan(["2"], pages_of=lambda pdf: opened.append(pdf.parent.name) or 4)
+        self.assertEqual(([lot.name for lot in plan.incoming], opened), (["2"], ["2"]))
+
+    def test_nothing_chosen_means_nothing_to_import(self):
         write_lot(self.source, "1")
-        write_lot(self.source, "2")
-        write_lot(self.source, "3")
-        self.registry.record_import("1", "scan.pdf", len(b"%PDF fake"))
+        plan = self.plan([])
+        self.assertEqual((plan.incoming, plan.idle), ([], True))
+
+    def test_lots_copied_earlier_are_resumed_without_being_chosen(self):
         write_lot(self.root, "2")                       # copied, waiting for the scan
-        (self.root / ARCHIVE / "3").mkdir(parents=True)  # scanned long ago
-        plan = self.plan()
-        self.assertEqual(plan.incoming, [])
-        self.assertEqual([lot.name for lot in plan.waiting], ["2"])
+        plan = self.plan([])
+        self.assertEqual(([lot.name for lot in plan.waiting], plan.scan_pages), (["2"], 10))
 
     def test_changed_source_lot_stops_everything(self):
         pdf = write_lot(self.source, "1")
@@ -188,6 +247,16 @@ class PlanTests(PipelineTestCase):
             raise ValueError("boom")
         self.assertEqual(self.plan(pages_of=broken).skipped, [("1", "PDF illisible (ValueError)")])
 
+    def test_progress_reaches_one_hundred_percent(self):
+        for name in ("1", "2"):
+            write_lot(self.source, name)
+        (self.source / "3").mkdir()                      # skipped, but still counted
+        write_lot(self.root, "4")
+        steps = []
+        self.plan(progress=lambda done, total: steps.append((done, total)))
+        self.assertEqual(steps[-1], (len(steps), len(steps)))
+        self.assertEqual(steps[-1], (7, 7))   # 3 chosen lots seen twice + 1 lot already in the root
+
     def test_resume_state_comes_from_the_folders(self):
         write_lot(self.root, "5")
         add_pdfs(self.root / "OCR", "5_1.pdf", "5_2.pdf", ".hidden.pdf")
@@ -208,15 +277,19 @@ class PlanTests(PipelineTestCase):
 
 
 class FormattingTests(PipelineTestCase):
-    def test_plan_text_mentions_lots_pages_resume_and_estimate(self):
+    def test_plan_text_mentions_lots_pages_skipped_and_estimate(self):
         for name in ("480", "481"):
             write_lot(self.source, name)
-        add_pdfs(self.root / "OCR", "1_1.pdf")
         (self.source / "9").mkdir()
         text = pipeline.format_plan(self.plan(pages_of=lambda pdf: 1500), self.config)
         self.assertIn("2 lots (480, 481), 3 000 pages", text)
-        self.assertIn("1 page en attente d'OCR", text)
         self.assertIn("Ignoré : lot 9", text)
+        self.assertIn("Durée estimée", text)
+
+    def test_plan_text_when_only_leftover_work_remains(self):
+        add_pdfs(self.root / "OCR", "1_1.pdf")
+        text = pipeline.format_plan(self.plan([]), self.config)
+        self.assertIn("seul le travail laissé par un lancement précédent", text)
         self.assertIn("Durée estimée", text)
 
     def test_estimate_combines_barcode_and_ocr_share(self):

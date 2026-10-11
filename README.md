@@ -31,10 +31,11 @@ activated. On Windows use `python main.py`.
 
 ## One-click run (`run_all.py`)
 
-`run_all.py` replaces the manual routine. It copies the new lots from the scan
-destination into the permanent working root, then chains the three stages
-(barcodes, OCR, final classification) and prints a summary. Originals in the
-source folder are never moved or modified.
+`run_all.py` replaces the manual routine. You pick the lots to process on a
+keyboard-driven list; it copies them from the scan destination into the
+permanent working root, then chains the three stages (barcodes, OCR, final
+classification) and prints a summary. Originals in the source folder are never
+moved or modified.
 
 One-time setup on the PC (inside WSL, in the project folder):
 
@@ -43,17 +44,40 @@ cp config.example.toml config.toml   # then set "source" and "racine" (WSL paths
 ./creer_raccourci.sh                 # creates the "Traitement SPED" shortcut on the Windows Desktop
 ```
 
-Daily use: double-click the shortcut, check the lots and estimated duration,
-press Enter. A summary is shown at the end and the `Review` folder is opened in
-Explorer. The same command works from a WSL terminal: `python run_all.py`
-(`--yes` skips the confirmation and the final pause, for a scheduled task).
+Daily use: double-click the shortcut, tick the lots (keys below), press Enter,
+check the page count and estimated duration, press Enter again. A summary is
+shown at the end and the `Review` folder is opened in Explorer. The same command
+works from a WSL terminal: `python run_all.py` (`--yes` takes every new lot and
+skips the list, the confirmation and the final pause, for a scheduled task).
+
+The list shows every lot of the source folder, highest number first: new lots in
+white, lots already processed in green with a check mark (not selectable), and
+lots copied but not finished (yellow, resumed automatically). Nothing is ticked
+at the start.
+
+| Key | Action |
+| --- | --- |
+| Up / Down | move one lot |
+| Left / Right | move 100 lots |
+| Page up / Page down, Home / End | move one page / go to the ends |
+| Space | tick or untick the lot |
+| `a` / `n` | tick every new lot / untick everything |
+| `r` | tick a range such as `600-610, 650` |
+| Enter | confirm the selection |
+| Esc | quit without doing anything |
+
+If a new lot is left out between lots that are done or selected (e.g. 611 when
+610 is done and 612 selected), a warning is printed before the analysis. Lots
+processed before the registry existed are declared once in `config.toml`
+(`deja_traites = "1-82, 200-472"`). Only the ticked lots are opened to count
+their pages, in parallel, so the estimate appears quickly.
 
 What it does, in order:
 
 1. Checks the folders, the BDD, the search list and the free disk space.
-2. Lists the new lots (numeric folders holding exactly one PDF, stable in size)
-   and asks for confirmation. A lot already imported is never copied again; if
-   its PDF changed in the source folder, the run stops without modifying anything.
+2. Inspects the selected lots (numeric folders holding exactly one PDF, stable
+   in size) and asks for confirmation. If the PDF of a lot imported earlier
+   changed in the source folder, the run stops without modifying anything.
 3. Copies each lot privately, verifies its size, then publishes it.
 4. Runs the barcode stage on the lots in the root, then moves each *published*
    lot's working copy to `Archive/` (the stage cannot rescan a published lot).

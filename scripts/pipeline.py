@@ -1,4 +1,4 @@
-"""One-click pipeline: import new lots, then barcode -> OCR -> final review.
+"""One-click pipeline: import the chosen lots, then barcode -> OCR -> final review.
 
 Lots are *copied* from the scan destination into the permanent working root;
 the originals are never modified. What remains to be done is read from the
@@ -16,7 +16,8 @@ import shutil
 import tempfile
 import time
 import tomllib
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,7 @@ from pathlib import Path
 from . import script as barcode
 from . import split_pages as split
 from .classify_pages import discover_database
+from .lot_catalog import CatalogLot, Ranges, Status, find_gaps, format_ranges, in_ranges, parse_ranges
 
 BARCODE_SCRIPT = "classify_pages.py"
 OCR_SCRIPT = "ocr_pages.py"
@@ -41,6 +43,7 @@ INTERRUPTED_CODE = 130
 # Copy + one-page split files: roughly twice the incoming PDFs, plus headroom.
 DISK_SAFETY_BYTES = 2 * 1024**3
 GIB = 1024**3
+ANALYSIS_THREADS = 8   # opening PDFs on a network-like drive is mostly waiting
 
 StageRunner = Callable[[str], int]
 
@@ -60,6 +63,7 @@ class Config:
     barcode_seconds_per_page: float = 0.5
     ocr_seconds_per_page: float = 3.5
     ocr_share: float = 0.5
+    already_done: Ranges = ()   # lots processed before this tool kept a registry
 
 
 def load_config(path: Path) -> Config:
@@ -87,10 +91,17 @@ def load_config(path: Path) -> Config:
     for name, value in numbers.items():
         if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
             raise PipelineError(f"config.toml : valeur invalide pour {name} ({value!r}).")
+    done = processing.get("deja_traites", "")
+    try:
+        if not isinstance(done, str):
+            raise ValueError("une chaîne est attendue, par exemple \"1-82, 200-472\"")
+        already_done = parse_ranges(done)
+    except ValueError as exc:
+        raise PipelineError(f"config.toml : [traitement] deja_traites : {exc}.") from exc
     return Config(
         source=Path(folders["source"]).expanduser(), root=Path(folders["racine"]).expanduser(),
         workers=workers, database=processing.get("bdd"), search_list=processing.get("liste"),
-        **{name: float(value) for name, value in numbers.items()})
+        already_done=already_done, **{name: float(value) for name, value in numbers.items()})
 
 
 # --- registry of imported lots ------------------------------------------------
@@ -246,64 +257,144 @@ def lot_directories(directory: Path) -> list[Path]:
         raise PipelineError(str(exc)) from exc
 
 
-def build_plan(config: Config, registry: Registry, *, sleep: Callable[[float], None] = time.sleep,
-               pages_of: Callable[[Path], int] = count_pages) -> Plan:
-    """Decide what a run would do, without touching anything."""
-    root = config.root
-    plan = Plan()
-    conflicts: list[str] = []
-    candidates: list[Path] = []
+def build_catalog(config: Config, registry: Registry) -> list[CatalogLot]:
+    """Every lot of the source folder with its status, highest number first.
+
+    Only folder names are read, never the PDFs, so that this stays instantaneous
+    however many lots the source holds.
+    """
+    in_root = {path.name for path in lot_directories(config.root)}
+    archive = config.root / ARCHIVE
+    archived = {path.name for path in archive.iterdir()} if archive.is_dir() else set()
+    catalog = []
     for lot in lot_directories(config.source):
-        pdf, error = split.discover_lot_pdf(lot)
-        record = registry.lots.get(lot.name)
-        if record is not None:
-            if pdf is not None and record.get("size") is not None and (
-                    pdf.name != record["pdf"] or pdf.stat().st_size != record["size"]):
-                conflicts.append(lot.name)
-            continue
-        if (root / lot.name).exists() or (root / ARCHIVE / lot.name).exists():
-            continue
-        if error:
-            plan.skipped.append((lot.name, error))
+        name = lot.name
+        if name in in_root:
+            status = Status.IN_PROGRESS
+        elif (registry.lots.get(name, {}).get("scanned_at") or name in archived
+              or in_ranges(int(name), config.already_done)):
+            status = Status.DONE
         else:
-            candidates.append(pdf)
+            status = Status.NEW
+        catalog.append(CatalogLot(name, status))
+    return sorted(catalog, key=lambda lot: split.natural_lot_sort_key(lot.name), reverse=True)
+
+
+def new_lots(catalog: Sequence[CatalogLot]) -> list[str]:
+    return [lot.name for lot in catalog if lot.status is Status.NEW]
+
+
+def run_parallel(function: Callable, items: Sequence, tick: Callable[[], None]) -> list:
+    """``function`` over ``items`` on several threads; results keep the order of ``items``."""
+    pool = ThreadPoolExecutor(max_workers=ANALYSIS_THREADS)
+    try:
+        futures = [pool.submit(function, item) for item in items]
+        for _ in as_completed(futures):
+            tick()
+        return [future.result() for future in futures]
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)   # a Ctrl+C must not wait for the queue
+
+
+def build_plan(config: Config, registry: Registry, lots: Sequence[str], *,
+               sleep: Callable[[float], None] = time.sleep, pages_of: Callable[[Path], int] = count_pages,
+               progress: Callable[[int, int], None] | None = None) -> Plan:
+    """Decide what a run would do for the chosen ``lots``, without touching anything.
+
+    Only the chosen lots (plus those already copied to the root) are opened.
+    ``progress(done, total)`` is called as the inspection advances.
+    """
+    plan = Plan()
+    chosen = sorted(lots, key=split.natural_lot_sort_key)
+    waiting_dirs = lot_directories(config.root)
+    total, done = 2 * len(chosen) + len(waiting_dirs), 0
+
+    def tick() -> None:
+        nonlocal done
+        done += 1
+        if progress:
+            progress(done, total)
+
+    def probe(name: str) -> tuple[Path | None, str | None, int]:
+        pdf, error = split.discover_lot_pdf(config.source / name)
+        if pdf is None:
+            return None, error, 0
+        try:
+            return pdf, None, pdf.stat().st_size
+        except OSError:
+            return None, "PDF illisible", 0
+
+    probes = run_parallel(probe, chosen, tick)
+    candidates: list[tuple[str, Path, int]] = []
+    conflicts: list[str] = []
+    for name, (pdf, error, size) in zip(chosen, probes):
+        if pdf is None:
+            plan.skipped.append((name, error))
+            continue
+        record = registry.lots.get(name)
+        if record is not None and record.get("size") is not None and (
+                pdf.name != record["pdf"] or size != record["size"]):
+            conflicts.append(name)
+        candidates.append((name, pdf, size))
     if conflicts:
         raise PipelineError(
             "Ces lots ont changé dans le dossier source depuis leur import : " + ", ".join(conflicts)
             + ".\nUn lot déposé est censé être définitif. Aucun fichier n'a été modifié ; "
             "vérifiez-les avant de relancer.")
-
-    sizes: dict[Path, int] = {}
-    for pdf in candidates:
-        with contextlib.suppress(OSError):
-            sizes[pdf] = pdf.stat().st_size
-    if sizes:
+    for _ in plan.skipped:
+        tick()
+    if candidates:
         sleep(config.stable_seconds)   # a lot still being written changes size meanwhile
-    for pdf in candidates:
-        name = pdf.parent.name
-        try:
-            if pdf.stat().st_size != sizes[pdf]:
-                plan.skipped.append((name, "copie en cours dans le dossier source, réessayez plus tard"))
-                continue
-            plan.incoming.append(LotInfo(name, pdf, sizes[pdf], pages_of(pdf)))
-        except (OSError, KeyError):
-            plan.skipped.append((name, "PDF illisible"))
-        except Exception as exc:  # noqa: BLE001 -- a corrupt PDF must not block the other lots
-            plan.skipped.append((name, f"PDF illisible ({type(exc).__name__})"))
 
-    for lot in lot_directories(root):
-        pdf, error = split.discover_lot_pdf(lot)
-        if error:
-            plan.skipped.append((lot.name, f"{error} (lot déjà dans la racine)"))
-            continue
+    def measure_incoming(candidate: tuple[str, Path, int]) -> LotInfo | str:
+        name, pdf, size = candidate
+        try:
+            if pdf.stat().st_size != size:
+                return "copie en cours dans le dossier source, réessayez plus tard"
+            return LotInfo(name, pdf, size, pages_of(pdf))
+        except OSError:
+            return "PDF illisible"
+        except Exception as exc:  # noqa: BLE001 -- a corrupt PDF must not block the other lots
+            return f"PDF illisible ({type(exc).__name__})"
+
+    def measure_waiting(directory: Path) -> LotInfo | str:
+        pdf, error = split.discover_lot_pdf(directory)
+        if pdf is None:
+            return f"{error} (lot déjà dans la racine)"
+        try:
+            size = pdf.stat().st_size
+        except OSError:
+            return "PDF illisible (lot déjà dans la racine)"
         try:
             pages = pages_of(pdf)
         except Exception:  # noqa: BLE001 -- stage 1 will report the unreadable PDF itself
             pages = 0
-        plan.waiting.append(LotInfo(lot.name, pdf, pdf.stat().st_size, pages))
-    plan.ocr_files = len(pdf_files(root / "OCR"))
-    plan.pending_files = len(pdf_files(root / "Pending"))
+        return LotInfo(directory.name, pdf, size, pages)
+
+    incoming = run_parallel(measure_incoming, candidates, tick)
+    waiting = run_parallel(measure_waiting, waiting_dirs, tick)
+    for name, result in zip((candidate[0] for candidate in candidates), incoming):
+        if isinstance(result, str):
+            plan.skipped.append((name, result))
+        else:
+            plan.incoming.append(result)
+    for directory, result in zip(waiting_dirs, waiting):
+        if isinstance(result, str):
+            plan.skipped.append((directory.name, result))
+        else:
+            plan.waiting.append(result)
+    plan.ocr_files = len(pdf_files(config.root / "OCR"))
+    plan.pending_files = len(pdf_files(config.root / "Pending"))
     return plan
+
+
+def format_gaps(catalog: Sequence[CatalogLot], chosen: Sequence[str]) -> str | None:
+    gaps = find_gaps(catalog, chosen)
+    if not gaps:
+        return None
+    subject = f"le lot {gaps[0]} n'est pas traité" if len(gaps) == 1 else (
+        f"les lots {format_ranges(map(int, gaps))} ne sont pas traités")
+    return f"Attention : {subject} alors que les lots voisins le sont ou vont l'être."
 
 
 def number(value: int) -> str:
@@ -336,20 +427,12 @@ def format_plan(plan: Plan, config: Config) -> str:
     if plan.incoming:
         names = [lot.name for lot in plan.incoming]
         pages = sum(lot.pages for lot in plan.incoming)
-        lines.append(f"Nouveaux lots à importer : {plural(len(names), 'lot')} ({lots_label(names)}), "
+        lines.append(f"Lots à importer : {plural(len(names), 'lot')} ({lots_label(names)}), "
                      f"{plural(pages, 'page')}")
+    elif plan.idle:
+        lines.append("Aucun lot à importer.")
     else:
-        lines.append("Aucun nouveau lot à importer.")
-    resume = []
-    if plan.waiting:
-        resume.append(f"{plural(len(plan.waiting), 'lot')} déjà copié(s) à analyser "
-                      f"({lots_label([lot.name for lot in plan.waiting])})")
-    if plan.ocr_files:
-        resume.append(f"{plural(plan.ocr_files, 'page')} en attente d'OCR")
-    if plan.pending_files:
-        resume.append(f"{plural(plan.pending_files, 'page')} en attente de classification finale")
-    if resume:
-        lines.append("Travail en attente d'un lancement précédent : " + " ; ".join(resume) + ".")
+        lines.append("Aucun lot à importer : seul le travail laissé par un lancement précédent sera repris.")
     for name, reason in plan.skipped:
         lines.append(f"Ignoré : lot {name} ({reason}).")
     if not plan.idle:

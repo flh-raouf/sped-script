@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-click run: import new lots, then barcode, OCR and final classification."""
+"""One-click run: choose lots, then import them and run barcode, OCR and final classification."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from main import build_command, execute_command
-from scripts import pipeline, wsl_host
+from scripts import lot_picker, pipeline, wsl_host
 
 PROJECT_DIRECTORY = Path(__file__).resolve().parent
 
@@ -19,6 +19,22 @@ def confirm() -> bool:
     except (EOFError, KeyboardInterrupt):
         return False
     return answer.strip().lower() not in {"n", "non"}
+
+
+def show_progress(done: int, total: int) -> None:
+    end = "\n" if done == total else ""
+    print(f"\r  {100 * done // max(1, total)} %", end=end, flush=True)
+
+
+def choose_lots(catalog, interactive: bool) -> list[str] | None:
+    """The lots to process: picked on screen, or every new lot when unattended."""
+    new = pipeline.new_lots(catalog)
+    if not (interactive and new):
+        return new
+    try:
+        return lot_picker.pick_lots(catalog)
+    except lot_picker.PickerError as exc:
+        raise pipeline.PipelineError(f"Impossible d'afficher la liste des lots : {exc}.") from exc
 
 
 def make_stage_runner(config: pipeline.Config, database: Path, search_list: Path) -> pipeline.StageRunner:
@@ -35,8 +51,16 @@ def run(args: argparse.Namespace, interactive: bool) -> int:
         database, search_list = pipeline.preflight(config)
         print(f"Source : {config.source}\nRacine : {config.root}\nBDD : {database.name} | Liste : {search_list.name}")
         registry = pipeline.Registry(pipeline.registry_path(config))
-        print("\nAnalyse des lots à traiter…", flush=True)
-        plan = pipeline.build_plan(config, registry)
+        catalog = pipeline.build_catalog(config, registry)
+        chosen = choose_lots(catalog, interactive)
+        if chosen is None:
+            print("\nAnnulé. Rien n'a été modifié.")
+            return 0
+        gaps = pipeline.format_gaps(catalog, chosen)
+        if gaps:
+            print(f"\n{gaps}")
+        print("\nAnalyse des lots…", flush=True)
+        plan = pipeline.build_plan(config, registry, chosen, progress=show_progress if interactive else None)
         print(pipeline.format_plan(plan, config))
         if plan.idle:
             print("\nRien à traiter.")
