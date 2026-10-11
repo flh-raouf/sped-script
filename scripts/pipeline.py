@@ -12,6 +12,7 @@ import csv
 import fcntl
 import hashlib
 import json
+import os
 import shutil
 import tempfile
 import time
@@ -60,8 +61,8 @@ class Config:
     database: str | None = None
     search_list: str | None = None
     stable_seconds: float = 5.0
-    barcode_seconds_per_page: float = 0.5
-    ocr_seconds_per_page: float = 3.5
+    barcode_seconds_per_page: float = 0.3   # measured throughput, all processes together
+    ocr_seconds_per_page: float = 3.0
     ocr_share: float = 0.5
     already_done: Ranges = ()   # lots processed before this tool kept a registry
 
@@ -235,10 +236,13 @@ class Plan:
 
 
 def pdf_files(directory: Path) -> list[Path]:
+    """The visible PDFs of a folder. Uses ``scandir``: the folders can hold tens of
+    thousands of one-page files, and a ``stat`` per file is slow on a Windows drive."""
     if not directory.is_dir():
         return []
-    return [path for path in directory.iterdir()
-            if path.is_file() and path.suffix.lower() == ".pdf" and not path.name.startswith(".")]
+    with os.scandir(directory) as entries:
+        return [Path(entry.path) for entry in entries
+                if entry.name.lower().endswith(".pdf") and not entry.name.startswith(".") and entry.is_file()]
 
 
 def count_pages(pdf: Path) -> int:
@@ -260,10 +264,11 @@ def lot_directories(directory: Path) -> list[Path]:
 def build_catalog(config: Config, registry: Registry) -> list[CatalogLot]:
     """Every lot of the source folder with its status, highest number first.
 
-    Only folder names are read, never the PDFs, so that this stays instantaneous
-    however many lots the source holds.
+    Only folder names and the small barcode reports are read, never the PDFs, so
+    that this stays instantaneous however many lots the source holds.
     """
     in_root = {path.name for path in lot_directories(config.root)}
+    published = published_history(config.root)
     archive = config.root / ARCHIVE
     archived = {path.name for path in archive.iterdir()} if archive.is_dir() else set()
     catalog = []
@@ -271,7 +276,7 @@ def build_catalog(config: Config, registry: Registry) -> list[CatalogLot]:
         name = lot.name
         if name in in_root:
             status = Status.IN_PROGRESS
-        elif (registry.lots.get(name, {}).get("scanned_at") or name in archived
+        elif (registry.lots.get(name, {}).get("scanned_at") or name in archived or name in published
               or in_ranges(int(name), config.already_done)):
             status = Status.DONE
         else:
@@ -411,7 +416,7 @@ def lots_label(names: list[str]) -> str:
 
 def estimate_seconds(plan: Plan, config: Config) -> float:
     pages = plan.scan_pages
-    barcode_time = pages * config.barcode_seconds_per_page / config.workers
+    barcode_time = pages * config.barcode_seconds_per_page
     ocr_time = (plan.ocr_files + pages * config.ocr_share) * config.ocr_seconds_per_page
     return barcode_time + ocr_time
 
@@ -433,6 +438,15 @@ def format_plan(plan: Plan, config: Config) -> str:
         lines.append("Aucun lot à importer.")
     else:
         lines.append("Aucun lot à importer : seul le travail laissé par un lancement précédent sera repris.")
+    leftover = []
+    if plan.waiting:
+        leftover.append(f"{plural(len(plan.waiting), 'lot')} déjà copié(s) ({plural(sum(lot.pages for lot in plan.waiting), 'page')})")
+    if plan.ocr_files:
+        leftover.append(f"{plural(plan.ocr_files, 'page')} en attente d'OCR")
+    if plan.pending_files:
+        leftover.append(f"{plural(plan.pending_files, 'page')} en attente de classification finale")
+    if leftover:
+        lines.append("Déjà en attente d'un lancement précédent (inclus dans la durée) : " + " ; ".join(leftover) + ".")
     for name, reason in plan.skipped:
         lines.append(f"Ignoré : lot {name} ({reason}).")
     if not plan.idle:
@@ -506,17 +520,26 @@ def barcode_runs(root: Path) -> set[Path]:
     return {path for path in directory.glob("*") if path.is_dir()} if directory.is_dir() else set()
 
 
-def read_barcode_run(root: Path, before: set[Path]) -> tuple[set[str], set[str]] | None:
-    """(lots listed, lots published) by the barcode run created since ``before``."""
-    created = sorted(barcode_runs(root) - before)
-    if not created:
-        return None
+def read_lots_report(run: Path) -> tuple[set[str], set[str]] | None:
+    """(lots listed, lots published) according to one barcode run's ``lots.csv``."""
     try:
-        with (created[-1] / "lots.csv").open(encoding="utf-8-sig", newline="") as handle:
-            rows = list(csv.DictReader(handle))
+        with (run / "lots.csv").open(encoding="utf-8-sig", newline="") as handle:
+            rows = [row for row in csv.DictReader(handle) if row.get("Lot")]
     except OSError:
         return None
-    return ({row["Lot"] for row in rows}, {row["Lot"] for row in rows if row["Published"] == "True"})
+    return ({row["Lot"] for row in rows}, {row["Lot"] for row in rows if row.get("Published") == "True"})
+
+
+def read_barcode_run(root: Path, before: set[Path]) -> tuple[set[str], set[str]] | None:
+    """The report of the barcode run created since ``before``."""
+    created = sorted(barcode_runs(root) - before)
+    return read_lots_report(created[-1]) if created else None
+
+
+def published_history(root: Path) -> set[str]:
+    """Lots published by any earlier barcode run, including those before this tool existed."""
+    reports = (read_lots_report(run) for run in barcode_runs(root))
+    return set().union(*(report[1] for report in reports if report))
 
 
 def run_checked(script: str, run_stage: StageRunner, summary: Summary, log) -> int:

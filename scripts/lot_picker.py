@@ -12,11 +12,12 @@ from .lot_catalog import CatalogLot, Status, in_ranges, parse_ranges
 
 JUMP = 100
 CHROME_LINES = 6   # title, three help lines, separator, footer
-HELP = (
-    " Haut/Bas : déplacer    Gauche/Droite : 100 lots    Page préc./suiv. : une page",
+HELP_KEYS = (
     " Espace : cocher/décocher    a : tous les nouveaux    n : aucun    r : plage",
     " Entrée : confirmer la sélection    Échap : quitter sans rien faire",
 )
+HELP_MOVE = {True: " ↑ ↓ : se déplacer    ← → : sauter de 100 lots",
+             False: " ^ v : se déplacer    < > : sauter de 100 lots"}   # for terminals without Unicode
 IN_PROGRESS_LABEL = "en cours, sera repris automatiquement"
 DONE_LABEL = "traité"
 ESCAPE = 27
@@ -95,7 +96,7 @@ def plural(count: int, singular: str, plural_form: str) -> str:
     return f"{count} {singular if count <= 1 else plural_form}"
 
 
-def render(state: PickerState, height: int, width: int, check: str = "✔") -> list[Line]:
+def render(state: PickerState, height: int, width: int, unicode: bool = True) -> list[Line]:
     """The screen as a list of lines, newest first, exactly as it will be painted."""
     state.scroll(max(1, height - CHROME_LINES))
     status = [row.status for row in state.rows]
@@ -103,12 +104,12 @@ def render(state: PickerState, height: int, width: int, check: str = "✔") -> l
              f"{status.count(Status.DONE)} traités")
     if Status.IN_PROGRESS in status:
         title += f", {status.count(Status.IN_PROGRESS)} en cours"
-    lines = [Line(title, bold=True), *(Line(text) for text in HELP), Line("-" * max(0, width - 1))]
+    lines = [Line(title, bold=True), *(Line(text) for text in (HELP_MOVE[unicode], *HELP_KEYS)), Line("-" * max(0, width - 1))]
     name_width = max(len(row.name) for row in state.rows)
     for index in range(state.top, min(len(state.rows), state.top + state.page_size)):
         row = state.rows[index]
         if row.status is Status.DONE:
-            box, color, label = check.center(3), "green", DONE_LABEL
+            box, color, label = ("✔" if unicode else "OK").center(3), "green", DONE_LABEL
         elif row.status is Status.IN_PROGRESS:
             box, color, label = "[x]", "yellow", IN_PROGRESS_LABEL
         else:
@@ -172,20 +173,15 @@ def typing_cursor() -> Iterator[None]:
         set_cursor(False)
 
 
-def _interact(screen, state: PickerState, colors: dict[str, int], check: str) -> list[str] | None:
-    moves = {curses.KEY_UP: -1, curses.KEY_DOWN: 1, curses.KEY_LEFT: -JUMP, curses.KEY_RIGHT: JUMP,
-             curses.KEY_HOME: -len(state.rows), curses.KEY_END: len(state.rows)}
+def _interact(screen, state: PickerState, colors: dict[str, int], unicode: bool) -> list[str] | None:
+    moves = {curses.KEY_UP: -1, curses.KEY_DOWN: 1, curses.KEY_LEFT: -JUMP, curses.KEY_RIGHT: JUMP}
     while True:
         height, width = screen.getmaxyx()
-        _paint(screen, render(state, height, width, check), colors)
+        _paint(screen, render(state, height, width, unicode), colors)
         key = screen.getch()
         state.message = ""
         if key in moves:
             state.move(moves[key])
-        elif key == curses.KEY_PPAGE:
-            state.move(-state.page_size)
-        elif key == curses.KEY_NPAGE:
-            state.move(state.page_size)
         elif key == ord(" "):
             state.toggle()
         elif key in (ord("a"), ord("A")):
@@ -220,13 +216,13 @@ def pick_lots(catalog: Sequence[CatalogLot]) -> list[str] | None:
     """
     with suppress(locale.Error):
         locale.setlocale(locale.LC_ALL, "")
-    check = "✔" if locale.getpreferredencoding(False).lower().replace("-", "") == "utf8" else "OK"
+    unicode = locale.getpreferredencoding(False).lower().replace("-", "") == "utf8"
     os.environ.setdefault("ESCDELAY", "25")   # make the Escape key react at once
     state = PickerState(catalog)
 
     def run(screen):
         set_cursor(False)
-        return _interact(screen, state, _setup_colors(), check)
+        return _interact(screen, state, _setup_colors(), unicode)
 
     try:
         return curses.wrapper(run)

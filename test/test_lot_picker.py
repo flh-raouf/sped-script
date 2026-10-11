@@ -124,7 +124,8 @@ class RenderTests(unittest.TestCase):
         lines = render(state, 20, 80)
         self.assertEqual(len(lines), 20)
         self.assertIn("300 au total, 199 nouveaux, 100 traités, 1 en cours", lines[0].text)
-        self.assertIn("Gauche/Droite : 100 lots", lines[1].text)
+        self.assertIn("↑ ↓ : se déplacer    ← → : sauter de 100 lots", lines[1].text)
+        self.assertNotIn("Page", "".join(line.text for line in lines[:5]))
         self.assertIn(">", lines[5].text)
         self.assertTrue(lines[5].reverse)
         self.assertIn("[ ]  300", lines[5].text)
@@ -142,12 +143,14 @@ class RenderTests(unittest.TestCase):
         self.assertIn("[x]", yellow.text)
         self.assertIn("250", yellow.text)
 
-    def test_ascii_fallback_for_the_check_mark(self):
+    def test_ascii_fallback_for_terminals_without_unicode(self):
         state = PickerState(lots())
         state.cursor = 150
-        done = next(line for line in render(state, 20, 80, check="OK") if line.color == "green")
+        lines = render(state, 20, 80, unicode=False)
+        done = next(line for line in lines if line.color == "green")
         self.assertIn("OK", done.text)
-        self.assertNotIn("✔", done.text)
+        self.assertIn("^ v : se déplacer    < > : sauter de 100 lots", lines[1].text)
+        self.assertFalse(any(char in line.text for line in lines for char in "✔↑↓←→"))
 
     def test_tiny_terminal_does_not_crash(self):
         lines = render(PickerState(lots()), 3, 10)
@@ -159,7 +162,7 @@ class InteractionTests(unittest.TestCase):
     def run_keys(self, keys, catalog=None, height: int = 20):
         screen = FakeScreen(keys, height=height)
         state = PickerState(catalog or lots())
-        result = lot_picker._interact(screen, state, {}, "✔")
+        result = lot_picker._interact(screen, state, {}, True)
         return result, state, screen
 
     def test_space_then_enter_returns_the_selection_in_numeric_order(self):

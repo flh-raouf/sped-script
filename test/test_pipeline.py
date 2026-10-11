@@ -176,6 +176,13 @@ class CatalogTests(PipelineTestCase):
         new, progress, done = Status.NEW, Status.IN_PROGRESS, Status.DONE
         self.assertEqual([lot.status for lot in catalog], [new, new, new, progress, done, done])
 
+    def test_lots_published_by_an_earlier_barcode_run_are_done(self):
+        for name in ("5", "6", "7"):
+            (self.source / name).mkdir()
+        barcode_report(self.root, [("5", True), ("6", False)], stamp="20250101_000000_000000")
+        barcode_report(self.root, [("9", True)], stamp="20250102_000000_000000")
+        self.assertEqual(self.statuses(), {"7": Status.NEW, "6": Status.NEW, "5": Status.DONE})
+
     def test_lots_declared_in_the_config_are_done(self):
         for name in ("82", "83", "300"):
             (self.source / name).mkdir()
@@ -290,14 +297,26 @@ class FormattingTests(PipelineTestCase):
         add_pdfs(self.root / "OCR", "1_1.pdf")
         text = pipeline.format_plan(self.plan([]), self.config)
         self.assertIn("seul le travail laissé par un lancement précédent", text)
+        self.assertIn("1 page en attente d'OCR", text)
         self.assertIn("Durée estimée", text)
+
+    def test_estimate_for_a_run_of_7446_pages(self):
+        plan = pipeline.Plan(incoming=[pipeline.LotInfo("1", Path("x"), 1, 7446)])
+        self.assertEqual(pipeline.format_estimate(pipeline.estimate_seconds(plan, self.config)), "3 h 43 min")
+
+    def test_pdf_files_ignores_hidden_files_other_extensions_and_folders(self):
+        add_pdfs(self.root / "OCR", "1_1.pdf", "2_1.PDF", ".hidden.pdf")
+        (self.root / "OCR" / "notes.txt").write_text("x")
+        (self.root / "OCR" / "folder.pdf").mkdir()
+        self.assertEqual(sorted(path.name for path in pipeline.pdf_files(self.root / "OCR")), ["1_1.pdf", "2_1.PDF"])
+        self.assertEqual(pipeline.pdf_files(self.root / "absent"), [])
 
     def test_estimate_combines_barcode_and_ocr_share(self):
         plan = pipeline.Plan(incoming=[pipeline.LotInfo("1", Path("x"), 1, 1000)], ocr_files=100)
         config = Config(source=self.source, root=self.root, workers=2)
-        # 1000 * 0.5 / 2 + (100 + 1000 * 0.5) * 3.5
-        self.assertEqual(pipeline.estimate_seconds(plan, config), 250 + 2100)
-        self.assertEqual(pipeline.format_estimate(2350), "39 min")
+        # 1000 pages * 0.3 s, then (100 waiting + half of the 1000 pages) * 3 s
+        self.assertEqual(pipeline.estimate_seconds(plan, config), 300 + 1800)
+        self.assertEqual(pipeline.format_estimate(2100), "35 min")
         self.assertEqual(pipeline.format_estimate(56000), "15 h 33 min")
 
     def test_idle_plan_has_no_estimate(self):

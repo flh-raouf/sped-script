@@ -57,9 +57,8 @@ at the start.
 
 | Key | Action |
 | --- | --- |
-| Up / Down | move one lot |
-| Left / Right | move 100 lots |
-| Page up / Page down, Home / End | move one page / go to the ends |
+| Up / Down arrows | move one lot |
+| Left / Right arrows | move 100 lots |
 | Space | tick or untick the lot |
 | `a` / `n` | tick every new lot / untick everything |
 | `r` | tick a range such as `600-610, 650` |
@@ -68,7 +67,8 @@ at the start.
 
 If a new lot is left out between lots that are done or selected (e.g. 611 when
 610 is done and 612 selected), a warning is printed before the analysis. Lots
-processed before the registry existed are declared once in `config.toml`
+published by any earlier barcode run (`Reports/barcode/*/lots.csv`) are shown as
+done; lots processed by other means can be declared in `config.toml`
 (`deja_traites = "1-82, 200-472"`). Only the ticked lots are opened to count
 their pages, in parallel, so the estimate appears quickly.
 

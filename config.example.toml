@@ -13,8 +13,9 @@ racine = "/mnt/d/CAPTURESPED"
 processus = 6
 # Secondes pendant lesquelles la taille d'un lot doit rester stable avant import.
 # attente_stabilite = 5
-# Lots déjà traités avant l'utilisation de ce raccourci : ils apparaissent en vert
-# dans la liste et ne peuvent plus être sélectionnés. Plages séparées par des virgules.
+# Lots traités autrement que par ce raccourci (les lots des anciens rapports de
+# codes-barres sont reconnus seuls) : en vert dans la liste, non sélectionnables.
+# Plages séparées par des virgules.
 # deja_traites = "1-82, 200-472"
 # À renseigner seulement si la racine contient plusieurs classeurs Excel.
 # bdd = "BDD_2024_2025_2026.xlsx"
@@ -22,6 +23,6 @@ processus = 6
 
 # Valeurs servant uniquement à estimer la durée affichée avant le lancement.
 # [estimation]
-# codes_barres = 0.5   # secondes par page
-# ocr = 3.5            # secondes par page
+# codes_barres = 0.3   # secondes par page (débit réel, tous processus confondus)
+# ocr = 3.0            # secondes par page
 # part_ocr = 0.5       # part des pages qui passent par l'OCR
