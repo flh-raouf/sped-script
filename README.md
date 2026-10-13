@@ -80,8 +80,9 @@ at the start.
 
 If a new lot is left out between lots that are done or selected (e.g. 611 when
 610 is done and 612 selected), a warning is printed before the analysis. Lots
-published by any earlier barcode run (`Reports/barcode/*/lots.csv`) are shown as
-done; lots processed by other means can be declared in `config.toml`
+published by any earlier barcode run (including those recorded in the former
+`Reports/` folder, which are copied into the registry) are shown as done;
+lots processed by other means can be declared in `config.toml`
 (`deja_traites = "1-82, 200-472"`). Only the ticked lots are opened to count
 their pages, in parallel, so the estimate appears quickly.
 
@@ -92,8 +93,12 @@ What it does, in order:
    in size) and asks for confirmation. If the PDF of a lot imported earlier
    changed in the source folder, the run stops without modifying anything.
 3. Copies each lot privately, verifies its size, then publishes it.
-4. Runs the barcode stage on the lots in the root, then moves each *published*
-   lot's working copy to `Archive/` (the stage cannot rescan a published lot).
+4. Runs the barcode stage on the lots in the root, then deletes each *published*
+   lot's working copy: its pages are all in `Output/` and `OCR/`, and the original
+   stays in the source folder. The copy is deleted only if the source still holds
+   a PDF with the same name and size; otherwise it is kept in `Archive/`. Earlier
+   copies left in `Archive/` are deleted under the same condition, and the summary
+   lists the ones kept.
 5. Runs OCR if `OCR/` holds pages, then the final classification if `Pending/`
    holds pages. Resuming after an interruption needs no special step: whatever
    remains in those folders is picked up by the next launch.
@@ -101,13 +106,14 @@ What it does, in order:
 Exit codes 0 and 1 of a stage (1 = warnings, e.g. pages sent to OCR) let the
 chain continue and appear in the summary. Any other code stops the run. Lots
 that fail the barcode stage stay in the root and are retried next time.
-Imported lots are recorded in `Reports/pipeline_state.json`, each run's summary
-is saved in `Reports/pipeline/`, and a second simultaneous run is refused.
+Imported lots are recorded in `Rapports/.interne/pipeline_state.json`, each run's
+summary is saved in `Rapports/Executions/`, and a second simultaneous run is refused.
 While running, Windows is kept from sleeping (best effort, via `powershell.exe`).
 
 The duration estimate learns from completed runs on this PC. Barcode, OCR and
-final classification save `performance.json` alongside their reports; import
-timings are saved under `Reports/import/<timestamp>/`. Failed/interrupted runs,
+final classification save `performance.json` in
+`Rapports/.interne/executions/<stage>/<timestamp>/`; import timings are saved
+under `Rapports/.interne/executions/import/<timestamp>/`. Failed/interrupted runs,
 OCR runs with page errors and review dry runs do not train the estimator.
 The shared launcher (`main.py` and `run_all.py`) also records Python startup and
 process shutdown time. Direct stage CLI commands record their internal elapsed
@@ -274,12 +280,7 @@ Parent/
   OCR/                       Awaiting OCR
   Pending/                   Awaiting tables/verso processing
   Review/                    Final pages for human review
-  Reports/
-    barcode/<timestamp>/     Per-lot and batch reports
-    ocr/<timestamp>/         OCR reports
-    review/<timestamp>/      Remaining-page reports
-    .ocr_cache.sqlite3       Shared persistent raw OCR cache
-    review_assignments.jsonl Durable classification provenance
+  Rapports/                  Cumulative reports (see below)
 ```
 
 ```bash
@@ -291,9 +292,61 @@ python scripts/review_pages.py -d "/path/to/Parent" --cache-only
 Only the designated input is scanned at each stage. Missing `OCR` or `Pending`
 folders explain which previous stage to run; empty inputs return successfully
 with “Nothing left to process.” Transfers preserve names and existing VIS folders.
-Barcode execution saves reports in a new timestamped folder and refuses PDF
-collisions before publishing a lot; it does not clear earlier results. Failed
-transfers retain the source for retry and appear in the stage's report.
+Barcode execution refuses PDF collisions before publishing a lot; it does not
+clear earlier results. Failed transfers retain the source for retry and appear
+in the reports.
+
+## Reports (`Rapports/`)
+
+The three stages, launched from `main.py` or `run_all.py`, complete the same
+cumulative reports. Nothing is split by stage or by launch: one global set of
+files covers every lot processed so far, and one folder per lot holds its
+details for all three stages.
+
+```text
+Parent/Rapports/
+  resume.txt                       Overall progress: lots, pages per state, search-list rows found
+  suivi_lots.xlsx                  One row per lot: pages classified by each stage, waiting,
+                                   to review, errors, rows found, durations, done/in progress
+  <search list>_found.xlsx         The search list with every row found so far highlighted
+  Pages/pages_lots_0001-0200.xlsx  One row per page, 200 lots per file (Excel stops at 1 048 576 rows)
+  Lots/<lot>/
+    pages.xlsx                     The lot's pages, same columns as Pages/
+    rapport.txt                    Page counts, then each stage: start, end, duration, outcome, remarks
+    code-barres.csv                What each stage recorded for each page
+    ocr.csv
+    classification.csv
+  Executions/                      One report per stage launch, and the summary of each complete run
+  .interne/                        Read by the scripts only: report store, OCR cache,
+                                   Review provenance, lot registry, logs and timings
+```
+
+Page rows keep the original seven columns (`lot_page`, `BDG`, `VIN`, `VIS`,
+`SEQ`, `SEQ_9`, `NOF`), then: state (*Classée*, *En attente d'OCR*,
+*En attente de classification*, *À revoir*), the stage that classified the page,
+whether it matches the search list, each stage's decision code, the last error
+and the PDF's current location. A later stage updates the page's row instead of
+adding one. Rescanning a lot replaces its rows. OCR and final classification
+take pages from several lots together, so a lot's OCR and classification
+durations are the sum of its pages' times.
+
+The pages are recorded in `Rapports/.interne/rapports.sqlite3`, and the readable
+files are rewritten from it at the end of each stage (lot folders also after
+each barcode lot). Only the lots and `Pages/` files that changed are rewritten.
+OCR and classification record a page before moving its PDF: if the move fails
+or is interrupted, the page is still in its input folder and is recorded again
+when it is retried. A file that cannot be replaced, usually because it is open
+in Excel, is listed in `resume.txt` and rewritten by the next stage. **Mise à
+jour complète des rapports** in the menu (`python scripts/reporting.py -d
+Parent --tout`) rewrites everything, for example after changing the search list.
+A PDF whose name is not `<lot>_<page>` is processed normally but cannot be
+attributed to a lot; the stage's log says so.
+
+The first launch moves the OCR cache, the Review provenance and the lot registry
+from the former `Reports/` folder to `Rapports/.interne/`. The old reports are
+not converted: the cumulative reports start with the next launch. `Reports/` is
+only read afterwards (lots published by earlier barcode runs, page metadata for
+the Review stage) and can be deleted once the pages it describes are processed.
 
 For existing executions using the old folder structure, add `--legacy-layout`
 to each script. Barcode then retains its original `output/` layout; OCR and
@@ -335,9 +388,10 @@ resolved through the BDD badge mapping. Other barcode payloads are ignored.
 The original extraction operation retains its existing identifier rules.
 
 Classified pages are centralised under `Parent/Output/<VIS>/`, with unresolved
-pages in `Parent/OCR/`. Barcode reports, per-lot workbooks, search-list
-highlighting, logs and private unfinished work are saved in
-`Parent/Reports/barcode/<timestamp>/`.
+pages in `Parent/OCR/`. The pages are added to the cumulative reports in
+`Parent/Rapports/`; the batch report goes to `Rapports/Executions/`, and the log,
+`lots.csv` and private unfinished work to
+`Rapports/.interne/executions/barcode/<timestamp>/`.
 
 The folder identifier is the VIS (the last eight VIN characters), never the
 full VIN. A badge-only page uses the BDD badge-to-VIS mapping before falling
@@ -349,8 +403,8 @@ the destination and any scan error, and retains one row per processed page.
 resolved through the BDD. OCR is a holding folder; this operation does not
 run text recognition or infer identifiers from neighbouring pages.
 
-`pages.xlsx` contains one row per processed page, sorted by numeric lot and
-page, with columns `lot_page`, `BDG`, `VIN`, `VIS`, `SEQ`, `SEQ_9`, and `NOF`.
+The page reports contain one row per processed page, sorted by numeric lot and
+page, starting with columns `lot_page`, `BDG`, `VIN`, `VIS`, `SEQ`, `SEQ_9`, and `NOF`.
 The page identifier omits the PDF extension, for example `479_1`. Resolved
 pages retain decoded Badge/VIN values and query the BDD to fill the other
 fields. In the supplied sources, `SEM` supplies the full `SEQ`, and valid
@@ -368,22 +422,20 @@ The supplied 2025 and 2026 BDD exports have no NOF column, so NOF remains blank
 for those records. The new report has a frozen header and column filters.
 
 Every lot starts its own timer before PDF discovery and splitting. Its
-duration includes scanning, per-lot Excel/CSV export, PDF publication and
-updating the cumulative CSV and highlighted search list. `processing.log`
+duration includes scanning and PDF publication. `processing.log`
 records lot start, split, scan, publication and finish events, with page counts,
 VIS/OCR totals and elapsed time. Failed and interrupted lots also have a
 status and duration. `lots.csv` lists every attempted lot with its start,
 finish, duration in `HH:MM:SS` and seconds, page counts and publication status.
-`report.txt` includes the lot durations and batch status and updates after
+The batch report includes the lot durations and batch status and updates after
 each lot. The whole-batch timer starts before BDD loading and scanner
-initialization and includes the final combined Excel export.
+initialization.
 
 Output is published **lot by lot**. During a lot's scan, its files stay in a
-private working directory inside `Reports/barcode/<timestamp>/_incomplete/`. Once the whole lot
-has been processed and its metadata saved, its PDFs are moved to the central
-VIS/OCR folders and its Excel/CSV files become available in
-`Reports/barcode/<timestamp>/lot_reports/<lot>/`. The script saves `results.csv`, search-list
-highlighting and the batch summary before starting the next lot. It never
+private working directory, `_incomplete/` in the run's technical folder. Once the
+whole lot has been processed, its PDFs are moved to the central VIS/OCR folders;
+its pages are recorded for the reports only if the whole lot is published, and
+its `Rapports/Lots/<lot>/` folder is written before the next lot starts. It never
 clears completed lots when a later lot fails or the batch is interrupted.
 An individual lot failure is logged and processing continues with the next
 lot; an interruption stops the batch. Unfinished lot files are retained under
@@ -391,10 +443,9 @@ lot; an interruption stops the batch. Unfinished lot files are retained under
 already moved files remain in the central folders and the remaining files
 and metadata stay in that lot's working directory.
 
-The combined `Reports/barcode/<timestamp>/pages.xlsx` is streamed from the saved per-lot CSVs once
-at batch end, avoiding repeated rewrites of a growing workbook. All per-lot
-Excel reports are already saved before that final export, so an interruption
-or export failure does not lose completed lots' identifiers or PDFs. There
+The global files (`Pages/`, `suivi_lots.xlsx`, the highlighted search list and
+`resume.txt`) are rewritten once at batch end. After Ctrl+C they are left for the
+next launch. A report that cannot be written never fails the stage. There
 is no automatic resume or skip mechanism.
 
 Original PDFs and workbooks are untouched. Existing classified PDFs are never
@@ -469,7 +520,7 @@ the detected printed sequence is recorded separately as `SEQ_DOC` in the CSV.
 The barcode algorithm is unchanged.
 
 Raw OCR results (text, bounding boxes, and confidence scores) are saved after
-each successful page in `Parent/Reports/.ocr_cache.sqlite3`. The cache key combines
+each successful page in `Parent/Rapports/.interne/cache_ocr.sqlite3`. The cache key combines
 the PDF's SHA-256 content hash with the models, rendering settings and runtime
 versions. Moving or renaming an unchanged PDF still permits a cache hit; changed
 PDF content, DPI, device or library versions trigger OCR again. Successful empty
@@ -484,25 +535,20 @@ input PDFs. A different existing PDF with the same destination filename is never
 overwritten, and the source is retained on transfer failure. Byte-identical
 existing destination files can be reused. Existing VIS folders are preserved.
 
-Each execution creates `Parent/Reports/ocr/<timestamp>/` with:
-
-- `results.csv`: progressively saved page metadata, decisions, cache hits,
-  individual durations, source/destination paths and errors.
-- `transfers.jsonl`: a durable mapping written before each transfer, so the
-  destination and identified metadata remain available after an interruption.
-- `processing.log` and `report.txt`: folder start, page progress, totals,
-  elapsed time, cache hits, errors and final or interrupted status.
-- `pages.xlsx`: the final seven-column page report (`lot_page`, `BDG`, `VIN`,
-  `VIS`, `SEQ`, `SEQ_9`, `NOF`), enriched from the matching BDD records. Unknown
-  pages retain a row with blank identifiers. Conflicting metadata fields stay
-  blank. The progressive CSV and transferred PDFs remain if final Excel export
-  cannot finish.
+Each page's metadata (enriched from the matching BDD records; conflicting fields
+stay blank), decision, cache hit, duration, source/destination and error go to
+the cumulative reports (`Rapports/Lots/<lot>/ocr.csv` and the page rows). The
+execution report (`Rapports/Executions/`) gives the totals, elapsed time and
+final or interrupted status. `Rapports/.interne/executions/ocr/<timestamp>/`
+holds `processing.log` and `transfers.jsonl`, a durable mapping written before
+each transfer. The search list is the one passed with `--excel`, or the only
+other workbook in the parent root; it only affects the reports.
 
 This uses normal `pathlib` paths and can be launched on Windows with the same
 Python commands; install the Paddle dependencies for the Windows environment.
 The implementation has been exercised on macOS; Windows execution has not been
-tested here. It does not update the earlier barcode reports or search-list
-highlighting: its own OCR reports record the recovered pages.
+tested here. Recovered pages complete the same page rows as the barcode stage,
+including search-list highlighting.
 
 ## Classification finale (tableaux de pièces et versos peu renseignés)
 
@@ -577,11 +623,11 @@ the OCR cache unless `--cache-only` is supplied; they never move PDFs.
 
 Each recovered PDF moves immediately into its existing VIS folder, preserving
 its `lot_page.pdf` name. Different existing destination PDFs are never
-overwritten. `Reports/review_assignments.jsonl` durably records metadata and provenance
-before transfers, preventing inheritance chains after interruptions. Each
-execution creates `Reports/review/<timestamp>/results.csv`, progressively flushed
-after every page, with metadata, method, predecessor, ink coverage, cache status,
-page duration and errors. `processing.log` and `report.txt` record the folder's
-start and total duration. `pages.xlsx` contains all input pages with the seven
-metadata columns, including blank identifiers for unresolved pages. Historical
-barcode/OCR reports remain unchanged; these Review reports describe this stage.
+overwritten. `Rapports/.interne/review_assignments.jsonl` durably records metadata
+and provenance before transfers, preventing inheritance chains after interruptions.
+Each page's metadata, method, predecessor, ink coverage, cache status, duration
+and errors go to the cumulative reports (`Rapports/Lots/<lot>/classification.csv`
+and the page rows). The execution report in `Rapports/Executions/` records the
+folder's totals and duration. Dry runs leave the reports unchanged: their
+`results.csv` and `pages.xlsx` stay in
+`Rapports/.interne/executions/review/<timestamp>/`.

@@ -21,7 +21,10 @@ ACTIONS = {
     "Classification finale (tableaux de pièces et versos peu renseignés)": "review_pages.py",
     ADDITIONAL_ACTION: None,
 }
+REPORT_SCRIPT = "reporting.py"
+STAGE_SCRIPTS = {"classify_pages.py", "ocr_pages.py", "review_pages.py"}
 ADDITIONAL_ACTIONS = {
+    "Mise à jour complète des rapports": REPORT_SCRIPT,
     "Nettoyage des fichiers cachés": "clean_hidden_files.py",
     "Éclatement des PDF en pages individuelles": "split_pages.py",
 }
@@ -52,6 +55,16 @@ def valid_workers(value: str) -> bool:
     return value.isascii() and value.isdigit() and int(value) > 0
 
 
+def search_lists(directory: Path, database: Path | None) -> list[Path]:
+    """Workbooks directly in ``directory`` that can be the search list."""
+    return sorted(
+        path for path in directory.iterdir()
+        if path.is_file() and path.suffix.lower() in {".xlsx", ".xlsm"}
+        and not path.name.startswith(("~$", "."))
+        and not path.stem.lower().endswith("_found")
+        and (path.resolve() != database if database is not None else not path.stem.lower().startswith("bdd")))
+
+
 def build_command(
     script: str, directory: Path, *, workers: int = 1,
     dry_run: bool = False, excel: Path | None = None, database: Path | None = None,
@@ -61,7 +74,7 @@ def build_command(
         raise ValueError(f"Unknown operation: {script}")
     command = [sys.executable, "-u", str(SCRIPT_DIRECTORY / script),
                "-d", str(directory)]
-    if script in {"classify_pages.py", "ocr_pages.py", "review_pages.py"}:
+    if script in STAGE_SCRIPTS:
         if workers <= 0:
             raise ValueError("Workers must be greater than zero.")
         command.extend(["-n", str(workers)])
@@ -71,12 +84,18 @@ def build_command(
         if database is not None:
             command.extend(["--database", str(database)])
     elif script in {"ocr_pages.py", "review_pages.py"}:
+        if excel is not None:
+            command.extend(["--excel", str(excel)])
         if database is not None:
             command.extend(["--database", str(database)])
         if output is not None:
             command.extend(["--output", str(output)])
         if script == "review_pages.py" and dry_run:
             command.append("--dry-run")
+    elif script == REPORT_SCRIPT:
+        if excel is not None:
+            command.extend(["--excel", str(excel)])
+        command.append("--tout")
     elif script == "clean_hidden_files.py" and dry_run:
         command.append("--dry-run")
     return command
@@ -156,6 +175,16 @@ def main() -> int:
                 window.content = colored_control
         return prompt.execute()
 
+    def choose_search_list(directory: Path, database: Path | None) -> Path | None:
+        workbooks = search_lists(directory, database)
+        if len(workbooks) <= 1:
+            return workbooks[0] if workbooks else None
+        selected = inquirer.select(
+            message="Liste de recherche :",
+            choices=[path.name for path in workbooks],
+        ).execute()
+        return directory / selected
+
     print("\nTraitement des documents\nUtilisez les flèches et Entrée. Ctrl+C annule une invite.\n")
     last_directory = ""
     while True:
@@ -191,7 +220,7 @@ def main() -> int:
             last_directory = str(directory)
             workers, dry_run, excel, database = 1, False, None, None
             output = None
-            if script in {"classify_pages.py", "ocr_pages.py", "review_pages.py"}:
+            if script in STAGE_SCRIPTS:
                 workers = int(inquirer.text(
                     message="Nombre de processus :", default="1",
                     validate=valid_workers,
@@ -200,26 +229,23 @@ def main() -> int:
             if script == "classify_pages.py":
                 database = discover_database(directory)
                 print(f"BDD détectée : {database.name}", flush=True)
-                workbooks = sorted(
-                    path for path in directory.iterdir()
-                    if path.is_file() and path.suffix.lower() in {".xlsx", ".xlsm"}
-                    and not path.name.startswith(("~$", "."))
-                    and not path.stem.lower().endswith("_found")
-                    and path.resolve() != database
-                )
-                if not workbooks:
+                excel = choose_search_list(directory, database)
+                if excel is None:
                     print("Aucun classeur Excel source trouvé directement dans ce dossier.\n")
                     continue
-                excel = workbooks[0]
-                if len(workbooks) > 1:
-                    selected = inquirer.select(
-                        message="Classeur source :",
-                        choices=[path.name for path in workbooks],
-                    ).execute()
-                    excel = directory / selected
-            elif script in {"ocr_pages.py", "review_pages.py"}:
-                input_name = 'OCR' if script == 'ocr_pages.py' else 'Pending'
-                print(f"Entrée : {directory / input_name}\nDossiers VIS : {directory / 'Output'}", flush=True)
+            elif script in {"ocr_pages.py", "review_pages.py", REPORT_SCRIPT}:
+                if script != REPORT_SCRIPT:
+                    input_name = 'OCR' if script == 'ocr_pages.py' else 'Pending'
+                    print(f"Entrée : {directory / input_name}\nDossiers VIS : {directory / 'Output'}", flush=True)
+                try:
+                    known_database = discover_database(directory)
+                except ConfigurationError:
+                    known_database = None
+                # The stage finds its BDD itself; the list only feeds the reports.
+                excel = choose_search_list(directory, known_database)
+                if excel is None:
+                    print("Aucune liste de recherche dans ce dossier : les rapports reprennent la dernière utilisée.",
+                          flush=True)
             elif script == "clean_hidden_files.py":
                 mode = inquirer.select(
                     message="Mode de nettoyage :",
@@ -235,6 +261,8 @@ def main() -> int:
             code = execute_command(command)
             if code == 0:
                 print("\nOpération terminée. Les éventuels résultats se trouvent dans le dossier sélectionné.")
+            if script in STAGE_SCRIPTS and code in (0, 1):
+                print(f"Rapports : {directory / 'Rapports'}")
             elif code == 130:
                 print("\nOpération interrompue. Des résultats partiels peuvent subsister.")
             else:

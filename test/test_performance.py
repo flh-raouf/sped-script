@@ -11,6 +11,7 @@ import main
 from scripts import ocr_pages as ocr
 from scripts import performance as perf
 from scripts import pipeline
+from scripts import reporting
 from test_ocr_pages import line
 
 
@@ -97,7 +98,7 @@ class HistoryFixture:
         self.root = Path(directory.name)
 
     def save(self, name, value):
-        directory = self.root / 'Reports' / 'ocr' / name
+        directory = reporting.runs_dir(self.root, 'ocr') / name
         directory.mkdir(parents=True)
         (directory / 'performance.json').write_text(json.dumps(value))
 
@@ -126,7 +127,7 @@ class HistoryTests(HistoryFixture, unittest.TestCase):
         self.assertIn('could not be saved', logs.output[0])
 
     def test_shared_launcher_adds_startup_and_shutdown_to_the_observation(self):
-        directory = self.root / 'Reports' / 'ocr' / '01'
+        directory = reporting.runs_dir(self.root, 'ocr') / '01'
         def finish():
             directory.mkdir(parents=True)
             perf.record(directory, 'ocr', workers=2, pages=100, seconds=20, setup_seconds=3)
@@ -170,6 +171,7 @@ class CacheSamplingTests(HistoryFixture, unittest.TestCase):
         sample = perf.cache_sample(self.root, 'ocr', files)
         self.assertEqual(sample.checked, 0)
         self.assertFalse((self.root / 'Reports').exists())
+        self.assertFalse((self.root / 'Rapports').exists())
 
     def test_large_backlog_has_a_bounded_sample(self):
         files = self.make_files(200)
@@ -231,7 +233,7 @@ class PipelineEstimateTests(HistoryFixture, unittest.TestCase):
         config = pipeline.Config(source=self.root, root=self.root, ocr_workers=6)
         plan = pipeline.Plan(ocr_files=10)
         self.assertEqual(perf.estimate(plan, config, lambda path: []).seconds, 10)  # 8 OCR + 2 final stage
-        directory = self.root / 'Reports' / 'ocr' / '01'
+        directory = reporting.runs_dir(self.root, 'ocr') / '01'
         directory.mkdir(parents=True)
         perf.record(directory, 'ocr', workers=6, pages=10, seconds=12, setup_seconds=2, unresolved=10)
         self.assertEqual(perf.estimate(plan, config, lambda path: []).seconds, 14)  # measured 12 OCR + 2 final

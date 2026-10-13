@@ -4,6 +4,7 @@ import csv
 import json
 import multiprocessing as mp
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -16,7 +17,22 @@ from test_split_pages import make_pdf
 
 import main
 from scripts import ocr_pages as ocr
+from scripts import reporting
 from scripts import review_pages as review
+
+
+def stage_rows(root, stage):
+    """Rows of the stage's latest run: its preview table, or what it recorded for the reports."""
+    run = max(reporting.runs_dir(root, stage).iterdir())
+    if (run / 'results.csv').exists():
+        with (run / 'results.csv').open(encoding='utf-8-sig', newline='') as handle:
+            return list(csv.DictReader(handle))
+    connection = sqlite3.connect(reporting.store_path(root))
+    try:
+        return [json.loads(detail) for (detail,) in connection.execute(
+            'SELECT detail FROM events WHERE stage=? AND run=? ORDER BY id', (stage, run.name))]
+    finally:
+        connection.close()
 
 
 def parts_table(badge='91034'):
@@ -357,9 +373,8 @@ class ParallelReviewTests(unittest.TestCase):
             return review.run(args)
 
     def rows(self, root):
-        report = max((root / 'Reports' / 'review').iterdir())
-        with (report / 'results.csv').open(encoding='utf-8-sig', newline='') as handle:
-            return report, list(csv.DictReader(handle))
+        report = max((root / 'Rapports' / 'Executions').glob('* - classification*.txt'))
+        return report, stage_rows(root, 'review')
 
     def test_parallel_cached_analysis_finishes_out_of_order_but_decisions_match_sequential(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -382,8 +397,8 @@ class ParallelReviewTests(unittest.TestCase):
             self.assertLess(max(event['start'] for event in events), min(event['end'] for event in events))
             self.assertLess(events[1]['end'], events[0]['end'])
             self.assertFalse(list((roots[0] / 'Pending').glob('*.ocr')))
-            self.assertIn('Workers: 2', (reports / 'report.txt').read_text())
-            self.assertTrue((reports / 'pages.xlsx').is_file())
+            self.assertIn('Workers: 2', reports.read_text())
+            self.assertTrue((roots[0] / 'Rapports' / 'Lots' / '1' / 'pages.xlsx').is_file())
             settings = ocr.performance.options('review') | {'cache_only': True}
             observation = ocr.performance.history(roots[0], 'review', settings)[0]
             self.assertEqual((observation.workers, observation.cache_hits, observation.unresolved), (2, 4, 2))
@@ -401,7 +416,7 @@ class ParallelReviewTests(unittest.TestCase):
             self.assertTrue(all(row['Cache'] == 'HIT' for row in rows))
             self.assertFalse(list(source.glob('*.ocr')))
             self.assertEqual(len(list(source.glob('*.pdf'))), 4)
-            self.assertFalse((root / 'Reports' / 'review_assignments.jsonl').exists())
+            self.assertFalse(reporting.provenance_path(root).exists())
 
     def test_cache_only_misses_do_not_start_models_or_render_pages(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -442,7 +457,7 @@ class ParallelReviewTests(unittest.TestCase):
             self.assertEqual(len(list(source.glob('*.pdf'))), 2)
             report, rows = self.rows(root)
             self.assertEqual(rows, [])
-            self.assertIn('Status: FAILED', (report / 'report.txt').read_text())
+            self.assertIn('Status: FAILED', report.read_text())
 
     def test_collision_retains_front_and_prevents_back_page_inheritance(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -470,7 +485,7 @@ class ParallelReviewTests(unittest.TestCase):
             self.assertEqual(self.execute(root), 1)
             self.assertTrue(failed.is_file())
             self.assertTrue((root / 'Review' / 'okay.pdf').is_file())
-            cache = ocr.OcrCache(root / 'Reports' / '.ocr_cache.sqlite3', ocr.ocr_settings(200, 'cpu'))
+            cache = ocr.OcrCache(reporting.cache_path(root), ocr.ocr_settings(200, 'cpu'))
             self.addCleanup(cache.close)
             self.assertEqual(cache.get(digest), [])
             self.assertEqual(self.execute(root, '--cache-only', workers=1, analyzer=plain_ink), 0)
@@ -483,11 +498,12 @@ class ParallelReviewTests(unittest.TestCase):
             digest = ocr.file_digest(source / 'change.pdf')
             self.assertEqual(self.execute(root), 1)
             self.assertTrue((source / 'change.pdf').is_file())
-            cache = ocr.OcrCache(root / 'Reports' / '.ocr_cache.sqlite3', ocr.ocr_settings(200, 'cpu'))
+            cache = ocr.OcrCache(reporting.cache_path(root), ocr.ocr_settings(200, 'cpu'))
             self.addCleanup(cache.close)
             self.assertIsNone(cache.get(digest))
-            _, rows = self.rows(root)
-            self.assertIn('Source changed', rows[0]['Error'])
+            log = (max(reporting.runs_dir(root, 'review').iterdir()) / 'processing.log').read_text()
+            self.assertIn('change.pdf | RuntimeError: Source changed', log)
+            self.assertIn('change.pdf | not in the reports', log)
 
     def test_worker_crash_stops_and_keeps_unpublished_sources(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -497,24 +513,24 @@ class ParallelReviewTests(unittest.TestCase):
                 self.execute(root, '--cache-only')
             self.assertEqual(len(list(source.glob('*.pdf'))), 2)
             report, _ = self.rows(root)
-            self.assertIn('Status: FAILED', (report / 'report.txt').read_text())
+            self.assertIn('Status: FAILED', report.read_text())
 
     def test_interruption_joins_workers_and_resume_keeps_predecessor_rules(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = self.prepare(root, ('1_10', '1_11', '1_12'))
-            original_append = review.classify.append_lot_csv
+            original_transfer = review.ocr.transfer_page
             def interrupt(*args):
-                original_append(*args)
+                original_transfer(*args)
                 raise KeyboardInterrupt
             before = {child.pid for child in mp.active_children()}
-            with patch.object(review.classify, 'append_lot_csv', side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+            with patch.object(review.ocr, 'transfer_page', side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
                 self.execute(root, '--cache-only')
             self.assertEqual({child.pid for child in mp.active_children()}, before)
             self.assertEqual(len(list(source.glob('*.analysis_started'))), 2)
             self.assertTrue((root / 'Output' / VIS / '1_10.pdf').is_file())
             report, rows = self.rows(root)
-            self.assertIn('Status: INTERRUPTED', (report / 'report.txt').read_text())
+            self.assertIn('Status: INTERRUPTED', report.read_text())
             self.assertEqual([row['lot_page'] for row in rows], ['1_10'])
             self.assertEqual(self.execute(root, '--cache-only', initializer=initialize_broken_worker), 0)
             self.assertTrue((root / 'Output' / VIS / '1_11.pdf').is_file())

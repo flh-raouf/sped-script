@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import csv
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
 
 from test_split_pages import make_pdf
 
-from scripts import pipeline
+from scripts import pipeline, reporting
 from scripts.lot_catalog import Status
 from scripts.pipeline import (ARCHIVE, BARCODE_SCRIPT, OCR_SCRIPT, REVIEW_SCRIPT, Config,
                               PipelineError, Registry)
@@ -34,8 +35,10 @@ def add_pdfs(folder: Path, *names: str) -> None:
         (folder / name).write_bytes(b"%PDF")
 
 
-def barcode_report(root: Path, rows: list[tuple[str, bool]], stamp: str = "20260101_000000_000000") -> None:
-    directory = root / "Reports" / "barcode" / stamp
+def barcode_report(root: Path, rows: list[tuple[str, bool]], stamp: str = "20260101_000000_000000",
+                   legacy: bool = False) -> None:
+    runs = reporting.legacy_runs_dir(root, "barcode") if legacy else reporting.runs_dir(root, "barcode")
+    directory = runs / stamp
     directory.mkdir(parents=True)
     with (directory / "lots.csv").open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.writer(handle)
@@ -200,6 +203,16 @@ class CatalogTests(PipelineTestCase):
         barcode_report(self.root, [("5", True), ("6", False)], stamp="20250101_000000_000000")
         barcode_report(self.root, [("9", True)], stamp="20250102_000000_000000")
         self.assertEqual(self.statuses(), {"7": Status.NEW, "6": Status.NEW, "5": Status.DONE})
+
+    def test_lots_published_before_the_new_report_folder_stay_done_once_it_is_deleted(self):
+        for name in ("5", "6"):
+            (self.source / name).mkdir()
+        barcode_report(self.root, [("5", True), ("6", False)], legacy=True)
+        self.assertEqual(self.statuses(), {"6": Status.NEW, "5": Status.DONE})
+        pipeline.remember_published(self.registry, self.root)
+        shutil.rmtree(self.root / "Reports")
+        self.registry = Registry(pipeline.registry_path(self.config))
+        self.assertEqual(self.statuses(), {"6": Status.NEW, "5": Status.DONE})
 
     def test_lots_declared_in_the_config_are_done(self):
         for name in ("82", "83", "300"):
@@ -386,7 +399,7 @@ class RunTests(PipelineTestCase):
     def run_pipeline(self, run_stage, plan=None):
         return pipeline.run_pipeline(self.config, self.registry, plan or self.plan(), run_stage, log=lambda text: None)
 
-    def test_full_chain_imports_scans_archives_and_runs_every_stage(self):
+    def test_full_chain_imports_scans_retires_copies_and_runs_every_stage(self):
         write_lot(self.source, "1")
         write_lot(self.source, "2")
 
@@ -412,7 +425,7 @@ class RunTests(PipelineTestCase):
         self.assertEqual((summary.imported, summary.scanned, summary.failed_lots), (["1", "2"], ["1", "2"], []))
         self.assertEqual(summary.review_added, 2)
         self.assertFalse((self.root / "1").exists())
-        self.assertTrue((self.root / ARCHIVE / "1" / "scan.pdf").exists())
+        self.assertFalse((self.root / ARCHIVE).exists())   # the originals are intact in the source
         self.assertTrue((self.source / "1" / "scan.pdf").exists())
         self.assertIsNotNone(Registry(pipeline.registry_path(self.config)).lots["2"]["scanned_at"])
 
@@ -461,7 +474,7 @@ class RunTests(PipelineTestCase):
         summary = self.run_pipeline(run_stage)
         self.assertEqual(run_stage.calls, [BARCODE_SCRIPT])
         self.assertIn("arrêt anormal", summary.error)
-        self.assertTrue((self.root / ARCHIVE / "1").is_dir())
+        self.assertFalse((self.root / "1").exists())
         self.assertTrue((self.root / "2").is_dir())
 
     def test_crash_without_any_report_is_fatal(self):
@@ -478,14 +491,15 @@ class RunTests(PipelineTestCase):
         self.assertEqual(run_stage.calls, [OCR_SCRIPT])
         self.assertIn("code 2", summary.error)
 
-    def test_interruption_still_archives_published_lots(self):
+    def test_interruption_still_retires_published_lots(self):
         for name in ("1", "2"):
             write_lot(self.source, name)
         run_stage = self.runner({BARCODE_SCRIPT: lambda: barcode_report(self.root, [("1", True), ("2", False)]) or 130})
         summary = self.run_pipeline(run_stage)
         self.assertTrue(summary.interrupted)
         self.assertEqual(run_stage.calls, [BARCODE_SCRIPT])
-        self.assertTrue((self.root / ARCHIVE / "1").is_dir())
+        self.assertFalse((self.root / "1").exists())
+        self.assertIsNotNone(self.registry.lots["1"]["scanned_at"])
         self.assertTrue((self.root / "2").is_dir())
 
     def test_disk_error_is_reported_instead_of_crashing(self):
@@ -505,6 +519,45 @@ class RunTests(PipelineTestCase):
         names = sorted(path.name for path in (self.root / ARCHIVE).iterdir())
         self.assertEqual(len(names), 2)
         self.assertEqual(names[0], "1")
+
+    def test_copy_whose_original_changed_or_vanished_is_kept_in_the_archive(self):
+        write_lot(self.source, "1", b"original")
+        write_lot(self.source, "2")
+        write_lot(self.root, "1", b"different copy")
+        write_lot(self.root, "2")
+        write_lot(self.root, "3")                      # no original at all
+        retired = {name: pipeline.retire_lot(self.config, self.registry, name) for name in ("1", "2", "3")}
+        self.assertEqual(retired, {"1": False, "2": True, "3": False})
+        self.assertEqual(sorted(path.name for path in (self.root / ARCHIVE).iterdir()), ["1", "3"])
+        self.assertTrue(all(self.registry.lots[name]["scanned_at"] for name in ("1", "2", "3")))
+
+    def test_archive_purge_deletes_only_copies_of_intact_originals(self):
+        write_lot(self.source, "4")
+        write_lot(self.source, "5", b"original")
+        for name, content in (("4", b"%PDF fake"), ("4_20260101_101010", b"%PDF fake"),
+                              ("5", b"changed"), ("6", b"%PDF fake")):
+            write_lot(self.root / ARCHIVE, name, content)
+        (self.root / ARCHIVE / "notes.txt").write_text("kept")
+        removed, kept = pipeline.purge_archive(self.config, self.registry)
+        self.assertEqual(removed, 2)
+        self.assertEqual(kept, ["5", "6", "notes.txt"])
+        self.assertIsNotNone(self.registry.lots["4"]["scanned_at"])
+        self.assertNotIn("5", self.registry.lots)
+        write_lot(self.source, "6")
+        for name in ("5", "notes.txt"):
+            path = self.root / ARCHIVE / name
+            shutil.rmtree(path) if path.is_dir() else path.unlink()
+        self.assertEqual(pipeline.purge_archive(self.config, self.registry), (1, []))
+        self.assertFalse((self.root / ARCHIVE).exists())
+
+    def test_pipeline_reports_the_freed_archive_and_the_copies_it_keeps(self):
+        write_lot(self.source, "4")
+        write_lot(self.root / ARCHIVE, "4")
+        write_lot(self.root / ARCHIVE, "6")
+        summary = self.run_pipeline(self.runner({}), pipeline.Plan(ocr_files=1))
+        text = pipeline.format_summary(summary)
+        self.assertIn("Archive : 1 copie de lot supprimée(s)", text)
+        self.assertIn("l'original manque ou diffère dans le dossier source : 6", text)
 
     def test_second_run_after_success_has_nothing_to_do(self):
         write_lot(self.source, "1")

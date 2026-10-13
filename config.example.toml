@@ -5,7 +5,7 @@
 # Lots finalisés, déposés par le service de scan. Jamais modifié : on y copie seulement.
 source = "/mnt/d/SCAN SPED DESTINATION"
 # Racine de travail permanente : lots copiés, Output/, OCR/, Pending/, Review/,
-# Reports/, Archive/, ainsi que la BDD et la liste de recherche Excel.
+# Rapports/, ainsi que la BDD et la liste de recherche Excel.
 racine = "/mnt/d/CAPTURESPED"
 
 [traitement]
@@ -26,7 +26,7 @@ processus_classification = 2
 # liste = "dirty list.xlsx"
 
 # Bases indicatives tant qu'il n'existe pas de mesures comparables sur ce PC.
-# Les exécutions terminées alimentent ensuite Reports/*/<date>/performance.json.
+# Les exécutions terminées alimentent ensuite Rapports/.interne/executions/*/<date>/performance.json.
 # La base OCR tient compte des processus et d'un surcoût, avant les mesures réelles.
 # [estimation]
 # codes_barres = 0.3   # secondes par page (débit réel, tous processus confondus)

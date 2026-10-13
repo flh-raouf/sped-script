@@ -68,7 +68,9 @@ class RunAllTests(unittest.TestCase):
         self.assertEqual(Path(command[command.index("--database") + 1]).name, "BDD.xlsx")
         self.assertIn("RÉSUMÉ : TERMINÉ", output)
         opened.assert_not_called()
-        self.assertEqual(len(list((self.root / "Reports" / "pipeline").glob("*.txt"))), 1)
+        summaries = list((self.root / "Rapports" / "Executions").glob("* - lancement complet.txt"))
+        self.assertEqual(len(summaries), 1)
+        self.assertIn("RÉSUMÉ : TERMINÉ", summaries[0].read_text(encoding="utf-8"))
 
     def test_stage_runner_uses_separate_worker_counts_for_each_stage(self):
         config = pipeline.Config(source=self.source, root=self.root, workers=6, ocr_workers=3, review_workers=2)
@@ -113,7 +115,10 @@ class RunAllTests(unittest.TestCase):
     def test_unattended_run_takes_every_new_lot(self):
         self.add_lots("1", "2", "3")
         self.assertEqual(self.launch("--yes")[0], 0)
-        self.assertEqual(sorted(path.name for path in (self.root / "Archive").iterdir()), ["1", "2", "3"])
+        self.assertEqual(pipeline.lot_directories(self.root), [])   # scanned copies deleted
+        self.assertFalse((self.root / "Archive").exists())
+        registry = pipeline.Registry(pipeline.registry_path(pipeline.load_config(self.config)))
+        self.assertTrue(all(registry.lots[name]["scanned_at"] for name in ("1", "2", "3")))
 
     def test_only_the_lots_ticked_in_the_list_are_processed(self):
         self.add_lots("1", "2", "3")
@@ -121,7 +126,8 @@ class RunAllTests(unittest.TestCase):
         code, output = self.launch_interactive(lambda catalog: shown.append(catalog) or ["2"])
         self.assertEqual(code, 0)
         self.assertEqual([lot.name for lot in shown[0]], ["3", "2", "1"])
-        self.assertEqual([path.name for path in (self.root / "Archive").iterdir()], ["2"])
+        registry = pipeline.Registry(pipeline.registry_path(pipeline.load_config(self.config)))
+        self.assertEqual([name for name, lot in registry.lots.items() if lot["scanned_at"]], ["2"])
         self.assertEqual(sorted(path.name for path in self.source.iterdir()), ["1", "2", "3"])
         self.assertIn("Lots à importer : 1 lot (2), 2 pages", output)
 
@@ -134,11 +140,14 @@ class RunAllTests(unittest.TestCase):
 
     def test_skipping_a_lot_between_processed_ones_is_flagged_before_the_analysis(self):
         self.add_lots("610", "611", "612")
+        # A registry kept in the former Reports/ folder is taken over.
         registry = pipeline.Registry(self.root / "Reports" / "pipeline_state.json")
         registry.record_import("610", "scan.pdf", 1)
         registry.mark_scanned("610")
         _, output = self.launch_interactive(lambda catalog: ["612"])
         self.assertIn("le lot 611 n'est pas traité", output)
+        self.assertFalse((self.root / "Reports" / "pipeline_state.json").exists())
+        self.assertTrue((self.root / "Rapports" / ".interne" / "pipeline_state.json").exists())
 
     def test_list_is_not_shown_when_there_is_nothing_new_to_pick(self):
         def refuse(catalog):

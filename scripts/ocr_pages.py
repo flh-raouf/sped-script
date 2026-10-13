@@ -33,12 +33,14 @@ if __package__:
     from . import split_pages as split
     from . import workflow
     from . import performance
+    from . import reporting
 else:
     import classify_pages as classify
     import script as barcode
     import split_pages as split
     import workflow
     import performance
+    import reporting
 
 DET_MODEL = 'PP-OCRv6_tiny_det'
 REC_MODEL = 'PP-OCRv6_tiny_rec'
@@ -488,10 +490,35 @@ def discover_bdd(source: Path, output: Path, explicit: Path | None) -> Path:
     raise barcode.ConfigurationError('BDD not found near input/output. Supply --database /path/to/BDD.xlsx')
 
 
+RESULT_HEADERS = (*classify.PAGE_HEADERS, 'SEQ_DOC', 'Status', 'Cache', 'Seconds', 'Source', 'PDF', 'Error')
+
+
+def open_store(root: Path, database_path: Path, search_list: Path | None, logger) -> reporting.Store:
+    """The cumulative reports, with the search list they highlight when one is found."""
+    store = reporting.Store(root)
+    try:
+        store.set_search_list(classify.discover_search_list(root, database_path, search_list))
+    except (barcode.ConfigurationError, OSError) as exc:
+        logger.warning('Reports | search list not updated: %s', exc)
+    return store
+
+
+def report_entry(root: Path, path: Path, row: tuple, decision: Decision, state: str, status: str,
+                 values: tuple, destination: Path | None, error: str, seconds: float) -> reporting.PageEntry | None:
+    identity = reporting.page_identity(path.stem)
+    if identity is None:
+        return None
+    return reporting.PageEntry(
+        *identity, state, row, status, dict(zip(RESULT_HEADERS, map(str, values))),
+        pdf=reporting.relative(root, destination or path), error=error, badges=decision.badges,
+        decoded_vis=tuple(vin[-8:] for vin in decision.vins), seconds=seconds)
+
+
 def run(args) -> int:
     started = time.perf_counter()
     started_at = datetime.now().astimezone()
     split.validate_root(args.directory)
+    root = args.directory.expanduser().resolve()
     paths = workflow.stage_paths(args, 'ocr')
     source, output = paths.source, paths.output
     if output == source:
@@ -507,11 +534,12 @@ def run(args) -> int:
     output.mkdir(parents=True, exist_ok=True)
     if not args.legacy_layout:
         paths.unresolved.mkdir(parents=True, exist_ok=True)
-    database_path = discover_bdd(source if args.legacy_layout else args.directory.expanduser().resolve(),
-                                 output, args.database)
+    database_path = discover_bdd(source if args.legacy_layout else root, output, args.database)
     lookup = Lookup(classify.load_database(database_path))
-    reports = paths.reports / started_at.strftime('%Y%m%d_%H%M%S_%f')
+    run_id = started_at.strftime('%Y%m%d_%H%M%S_%f')
+    reports = paths.reports / run_id
     reports.mkdir(parents=True)
+    report_path = None if args.legacy_layout else reporting.execution_report_path(root, started_at, 'ocr')
     logger = logging.getLogger('ocr_recovery')
     logger.setLevel(logging.INFO)
     logger.propagate = False
@@ -520,11 +548,13 @@ def run(args) -> int:
     handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
     logger.addHandler(handler)
     cache = OcrCache((args.cache or paths.cache).expanduser(), ocr_settings(args.dpi, args.device))
+    store = None
+    interrupted = False
     workers = min(args.workers, len(files))
     hits = recovered = review = errors = attempted = 0
     input_bytes = 0
-    classify.save_csv(reports / 'results.csv',
-                      (*classify.PAGE_HEADERS, 'SEQ_DOC', 'Status', 'Cache', 'Seconds', 'Source', 'PDF', 'Error'), [])
+    if args.legacy_layout:
+        classify.save_csv(reports / 'results.csv', RESULT_HEADERS, [])
     logger.info('Folder START | %s | input=%s | models=%s/%s | pages=%d | workers=%d',
                 started_at.isoformat(), source, DET_MODEL, REC_MODEL, len(files), workers)
     print(f'OCR | pages={len(files)} | workers={workers}', flush=True)
@@ -537,8 +567,12 @@ def run(args) -> int:
                 f'Workers: {workers}\n'
                 f'{paths.unresolved.name}: {review}\n'
                 f'OCR cache hits: {hits}\nErrors: {errors}\nBDD: {database_path}\n')
-        barcode.atomic_text_write(reports / 'report.txt', lambda handle: handle.write(text))
+        if report_path is not None:
+            text += f'Reports: {reporting.reports_dir(root)}\nTechnical files: {reports}\n'
+        barcode.atomic_text_write(report_path or reports / 'report.txt', lambda handle: handle.write(text))
     try:
+        if not args.legacy_layout:
+            store = open_store(root, database_path, args.excel, logger)
         summary('RUNNING')
         setup_seconds = time.perf_counter() - started
         with closing(read_pages(files, cache, args.dpi, args.device, workers)) as pages:
@@ -551,6 +585,9 @@ def run(args) -> int:
                 decision = Decision(None, 'ERROR')
                 hit = page.cache_hit
                 error = ''
+                recorded = None
+                if store is not None and reporting.page_identity(path.stem) is None:
+                    logger.warning('Page %s | not in the reports: the name is not <lot>_<page>', path.name)
                 try:
                     if page.error is not None:
                         raise page.error
@@ -567,6 +604,14 @@ def run(args) -> int:
                                                   'decision': asdict(decision)}, ensure_ascii=False) + '\n')
                         journal.flush()
                         os.fsync(journal.fileno())
+                    if store is not None:
+                        seconds = page.seconds + time.perf_counter() - page_started
+                        entry = report_entry(
+                            root, path, enriched, decision,
+                            reporting.CLASSIFIED if decision.vis else reporting.WAITING_REVIEW, decision.reason,
+                            (*enriched, ';'.join(decision.sequences), decision.reason, 'HIT' if hit else 'MISS',
+                             f'{seconds:.3f}', path, destination, ''), destination, '', seconds)
+                        recorded = entry and store.record('ocr', run_id, entry)
                     transfer_page(path, destination, digest, args.copy)
                     recovered += bool(decision.vis)
                     review += not bool(decision.vis)
@@ -578,19 +623,27 @@ def run(args) -> int:
                     logger.exception('Page %s | ERROR | source retained when transfer fails', path.name)
                 attempted += 1
                 elapsed = page.seconds + time.perf_counter() - page_started
-                classify.append_lot_csv(reports / 'results.csv', [(*enriched, ';'.join(decision.sequences),
-                                        'ERROR' if error else decision.reason, 'HIT' if hit else 'MISS',
-                                        f'{elapsed:.3f}', str(path), str(destination or ''), error)])
+                values = (*enriched, ';'.join(decision.sequences), 'ERROR' if error else decision.reason,
+                          'HIT' if hit else 'MISS', f'{elapsed:.3f}', str(path), str(destination or ''), error)
+                if args.legacy_layout:
+                    classify.append_lot_csv(reports / 'results.csv', [values])
+                elif error:
+                    # The page stays in OCR/: record why, in place of its intended destination.
+                    entry = report_entry(root, path, enriched, decision, reporting.WAITING_OCR, 'ERROR',
+                                         values[:-2] + ('', error), None, error, elapsed)
+                    if entry is not None:
+                        store.record('ocr', run_id, entry, replaces=recorded)
                 logger.info('Page %s | %s | cache=%s | duration=%.3fs | destination=%s',
                             path.name, 'ERROR' if error else decision.reason, 'HIT' if hit else 'MISS', elapsed, destination)
                 print(f'{attempted}/{len(files)} | {path.name} | {"ERROR" if error else decision.reason} | '
                       f'cache={"HIT" if hit else "MISS"} | {elapsed:.3f}s', flush=True)
                 summary('RUNNING')
-        import csv
-        with (reports / 'results.csv').open(encoding='utf-8-sig', newline='') as handle:
-            rows = csv.reader(handle)
-            next(rows)
-            classify.write_page_workbook(reports / 'pages.xlsx', (tuple(row[:7]) for row in rows))
+        if args.legacy_layout:
+            import csv
+            with (reports / 'results.csv').open(encoding='utf-8-sig', newline='') as handle:
+                rows = csv.reader(handle)
+                next(rows)
+                classify.write_page_workbook(reports / 'pages.xlsx', (tuple(row[:7]) for row in rows))
         summary('COMPLETED_WITH_ERRORS' if errors else 'COMPLETED')
         if not errors:
             performance.record(reports, 'ocr', workers=0 if hits == attempted else workers,
@@ -600,14 +653,21 @@ def run(args) -> int:
         logger.info('Folder FINISHED | duration=%.3fs | recovered=%d | review=%d | cache hits=%d',
                     time.perf_counter() - started, recovered, review, hits)
         print(f'Finished | VIS={recovered} | {paths.unresolved.name}={review} | '
-              f'cache hits={hits} | reports={reports}', flush=True)
+              f'cache hits={hits} | reports={report_path or reports}', flush=True)
         return 1 if errors else 0
     except BaseException as exc:
+        interrupted = isinstance(exc, KeyboardInterrupt)
         logger.error('Folder stopped: %s', exc or type(exc).__name__)
-        summary('INTERRUPTED' if isinstance(exc, KeyboardInterrupt) else 'FAILED')
+        summary('INTERRUPTED' if interrupted else 'FAILED')
         raise
     finally:
         cache.close()
+        if store is not None:
+            # After Ctrl+C, stop now: the next stage or launch rewrites the stale reports.
+            if not interrupted:
+                print('Updating the cumulative reports…', flush=True)
+                reporting.refresh_quietly(root, store, logger)
+            store.close()
         split.close_logger(logger)
 
 
@@ -617,6 +677,7 @@ def parse_args(argv=None):
     parser.add_argument('-o', '--output', type=Path, help='Override VIS destination; defaults to parent/Output')
     parser.add_argument('--legacy-layout', action='store_true', help='Use the old direct-input folder layout')
     parser.add_argument('--database', type=Path)
+    parser.add_argument('--excel', type=Path, help='Search list highlighted in the reports (default: discovered)')
     parser.add_argument('--cache', type=Path, help='Persistent raw OCR SQLite cache')
     parser.add_argument('--copy', action='store_true', help='Keep original PDFs instead of moving them')
     parser.add_argument('-n', '--workers', type=int, default=1,

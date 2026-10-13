@@ -16,6 +16,11 @@ from dataclasses import asdict, dataclass
 from functools import lru_cache
 from pathlib import Path
 
+if __package__:
+    from . import reporting
+else:
+    import reporting
+
 SCHEMA = 1
 HISTORY_LIMIT = 40
 CACHE_SAMPLE_LIMIT = 24
@@ -152,7 +157,7 @@ def record(directory: Path, stage: str, *, workers: int, pages: int, seconds: fl
 def history(root: Path, stage: str, settings: dict | None = None) -> list[Run]:
     settings = options(stage) if settings is None else settings
     try:
-        paths = sorted((root / 'Reports' / stage).glob('*/performance.json'), reverse=True)[:HISTORY_LIMIT]
+        paths = sorted(reporting.runs_dir(root, stage).glob('*/performance.json'), reverse=True)[:HISTORY_LIMIT]
     except OSError:
         return []
     runs = []
@@ -185,7 +190,7 @@ def history(root: Path, stage: str, settings: dict | None = None) -> list[Run]:
 
 def measurement_paths(root: Path, stage: str) -> set[Path]:
     try:
-        return set(sorted((root / 'Reports' / stage).glob('*/performance.json'), reverse=True)[:HISTORY_LIMIT])
+        return set(sorted(reporting.runs_dir(root, stage).glob('*/performance.json'), reverse=True)[:HISTORY_LIMIT])
     except OSError:
         return set()
 
@@ -220,7 +225,7 @@ def cache_sample(root: Path, stage: str, files: list[Path]) -> CacheSample:
     cache = None
     checked = hits = total_bytes = 0
     try:
-        cache = ocr.OcrCache(root / 'Reports' / '.ocr_cache.sqlite3',
+        cache = ocr.OcrCache(reporting.cache_path(root),
                              ocr.ocr_settings(200, 'cpu'), read_only=True)
         selected = random.Random(0).sample(sorted(files), min(CACHE_SAMPLE_LIMIT, len(files)))
         started = time.monotonic()

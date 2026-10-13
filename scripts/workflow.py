@@ -2,6 +2,11 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+if __package__:
+    from . import reporting
+else:
+    import reporting
+
 
 @dataclass(frozen=True)
 class StagePaths:
@@ -31,6 +36,6 @@ def stage_paths(args, stage):
     unresolved = root/('Pending' if stage == 'ocr' else 'Review')
     if output == unresolved or output in unresolved.parents or unresolved in output.parents:
         raise ValueError('VIS output must be separate from the unresolved-page folder')
-    reports = root/'Reports'
-    return StagePaths(source, output, unresolved,
-                      reports/stage, reports/'.ocr_cache.sqlite3', reports/'review_assignments.jsonl')
+    reporting.prepare(root)
+    return StagePaths(source, output, unresolved, reporting.runs_dir(root, stage),
+                      reporting.cache_path(root), reporting.provenance_path(root))

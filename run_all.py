@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from main import build_command, execute_command
-from scripts import lot_picker, pipeline, wsl_host
+from scripts import lot_picker, pipeline, reporting, wsl_host
 
 PROJECT_DIRECTORY = Path(__file__).resolve().parent
 
@@ -48,11 +49,14 @@ def make_stage_runner(config: pipeline.Config, database: Path, search_list: Path
 
 
 def run(args: argparse.Namespace, interactive: bool) -> int:
+    started_at = datetime.now()
     config = pipeline.load_config(args.config)
     with pipeline.run_lock(config.root):
         database, search_list = pipeline.preflight(config)
         print(f"Source : {config.source}\nRacine : {config.root}\nBDD : {database.name} | Liste : {search_list.name}")
+        reporting.prepare(config.root)
         registry = pipeline.Registry(pipeline.registry_path(config))
+        pipeline.remember_published(registry, config.root)
         catalog = pipeline.build_catalog(config, registry)
         chosen = choose_lots(catalog, interactive)
         if chosen is None:
@@ -78,7 +82,8 @@ def run(args: argparse.Namespace, interactive: bool) -> int:
                                             make_stage_runner(config, database, search_list))
     text = pipeline.format_summary(summary)
     print(text)
-    print(f"Résumé enregistré : {pipeline.save_summary(config, text)}")
+    print(f"Résumé enregistré : {pipeline.save_summary(config, text, started_at)}")
+    print(f"Rapports : {reporting.reports_dir(config.root)}")
     if interactive:
         review = config.root / "Review"
         wsl_host.open_folder(review if review.is_dir() else config.root)

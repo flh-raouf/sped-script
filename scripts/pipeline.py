@@ -14,7 +14,9 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
+import sqlite3
 import tempfile
 import time
 import tomllib
@@ -27,6 +29,7 @@ from pathlib import Path
 from . import script as barcode
 from . import split_pages as split
 from . import performance
+from . import reporting
 from .classify_pages import discover_database
 from .lot_catalog import CatalogLot, Ranges, Status, find_gaps, format_ranges, in_ranges, parse_ranges
 
@@ -39,9 +42,7 @@ STAGE_LABELS = {
     REVIEW_SCRIPT: "Classification finale",
 }
 
-REPORTS = "Reports"
 ARCHIVE = "Archive"
-STATE_NAME = "pipeline_state.json"
 INTERRUPTED_CODE = 130
 # Copy + one-page split files: roughly twice the incoming PDFs, plus headroom.
 DISK_SAFETY_BYTES = 2 * 1024**3
@@ -145,8 +146,13 @@ class Registry:
         self.save()
 
     def mark_scanned(self, name: str) -> None:
-        record = self.lots.setdefault(name, {"pdf": None, "size": None, "imported_at": None})
-        record["scanned_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+        self.mark_scanned_many([name])
+
+    def mark_scanned_many(self, names: Sequence[str]) -> None:
+        moment = datetime.now().astimezone().isoformat(timespec="seconds")
+        for name in names:
+            record = self.lots.setdefault(name, {"pdf": None, "size": None, "imported_at": None})
+            record["scanned_at"] = moment
         self.save()
 
     def save(self) -> None:
@@ -156,7 +162,16 @@ class Registry:
 
 
 def registry_path(config: Config) -> Path:
-    return config.root / REPORTS / STATE_NAME
+    return reporting.registry_path(config.root)
+
+
+def remember_published(registry: Registry, root: Path) -> None:
+    """Keep in the registry the lots that earlier barcode runs published, so that
+    deleting old report folders never turns a processed lot back into a new one."""
+    missing = sorted(name for name in published_history(root)
+                     if not registry.lots.get(name, {}).get("scanned_at"))
+    if missing:
+        registry.mark_scanned_many(missing)
 
 
 # --- locking, preflight, disk -------------------------------------------------
@@ -492,6 +507,8 @@ class Summary:
     review_total: int = 0
     left_ocr: int = 0
     left_pending: int = 0
+    archived: list[str] = field(default_factory=list)    # copies kept: original changed or missing
+    archive_removed: int = 0
     error: str | None = None
     interrupted: bool = False
     seconds: float = 0.0
@@ -521,7 +538,7 @@ def import_lots(config: Config, registry: Registry, lots: list[LotInfo], summary
         registry.record_import(lot.name, lot.pdf.name, lot.size)
         summary.imported.append(lot.name)
     if lots:
-        directory = config.root / REPORTS / 'import' / datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        directory = reporting.runs_dir(config.root, 'import') / datetime.now().strftime('%Y%m%d_%H%M%S_%f')
         try:
             directory.mkdir(parents=True)
         except OSError as exc:
@@ -533,7 +550,7 @@ def import_lots(config: Config, registry: Registry, lots: list[LotInfo], summary
 
 
 def archive_lot(config: Config, registry: Registry, name: str) -> None:
-    """Retire a scanned working copy; the original stays in the source folder."""
+    """Keep a scanned working copy aside in ``Archive/``."""
     archive = config.root / ARCHIVE
     archive.mkdir(exist_ok=True)
     target = archive / name
@@ -543,9 +560,76 @@ def archive_lot(config: Config, registry: Registry, name: str) -> None:
     registry.mark_scanned(name)
 
 
+def original_intact(config: Config, name: str, copy_directory: Path) -> bool:
+    """The source folder still holds the lot's PDF, with the copy's name and size."""
+    copy, _ = split.discover_lot_pdf(copy_directory)
+    original, _ = split.discover_lot_pdf(config.source / name)
+    try:
+        return bool(copy and original and copy.name == original.name
+                    and copy.stat().st_size == original.stat().st_size)
+    except OSError:
+        return False
+
+
+def retire_lot(config: Config, registry: Registry, name: str) -> bool:
+    """Delete a scanned working copy whose original is intact in the source folder.
+
+    Its pages are all in ``Output/`` and ``OCR/``, so the copy is no longer
+    needed. Without an intact original, the copy is kept in ``Archive/``.
+    Return whether the copy was deleted.
+    """
+    working = config.root / name
+    if original_intact(config, name, working):
+        try:
+            shutil.rmtree(working)
+        except OSError:
+            pass
+        else:
+            registry.mark_scanned(name)
+            return True
+    archive_lot(config, registry, name)
+    return False
+
+
+ARCHIVED_NAME = re.compile(r"([0-9]+)(?:_[0-9]{8}_[0-9]{6})?")
+
+
+def purge_archive(config: Config, registry: Registry) -> tuple[int, list[str]]:
+    """Delete the archived copies whose original is intact in the source folder.
+
+    Return (copies deleted, archive entries kept).
+    """
+    archive = config.root / ARCHIVE
+    if not archive.is_dir():
+        return 0, []
+    removed, kept = [], []
+    for entry in sorted(archive.iterdir(), key=lambda path: path.name):
+        match = ARCHIVED_NAME.fullmatch(entry.name)
+        if not entry.is_dir() or not match or not original_intact(config, match[1], entry):
+            if not entry.name.startswith("."):
+                kept.append(entry.name)
+            continue
+        try:
+            shutil.rmtree(entry)
+        except OSError:
+            kept.append(entry.name)
+        else:
+            removed.append(match[1])
+    done = [name for name in dict.fromkeys(removed) if not registry.lots.get(name, {}).get("scanned_at")]
+    if done:
+        registry.mark_scanned_many(done)
+    with contextlib.suppress(OSError):
+        archive.rmdir()   # only when empty
+    return len(removed), kept
+
+
 def barcode_runs(root: Path) -> set[Path]:
-    directory = root / REPORTS / "barcode"
-    return {path for path in directory.glob("*") if path.is_dir()} if directory.is_dir() else set()
+    """Every barcode run's technical folder, including those of the former ``Reports/``."""
+    runs = set()
+    for directory in (reporting.runs_dir(root, "barcode"), reporting.legacy_runs_dir(root, "barcode")):
+        if directory.is_dir():
+            runs.update(path for path in directory.glob("*") if path.is_dir())
+    return runs
 
 
 def read_lots_report(run: Path) -> tuple[set[str], set[str]] | None:
@@ -596,7 +680,8 @@ def scan_barcodes(config: Config, registry: Registry, run_stage: StageRunner, su
         outcome = read_barcode_run(config.root, before)
         published = outcome[1] if outcome else set()
         for name in sorted(published):
-            archive_lot(config, registry, name)
+            if not retire_lot(config, registry, name):
+                summary.archived.append(name)
         summary.scanned = sorted(published)
         summary.failed_lots = [name for name in lots if name not in published]
     label = STAGE_LABELS[BARCODE_SCRIPT]
@@ -630,18 +715,37 @@ def run_pipeline(config: Config, registry: Registry, plan: Plan, run_stage: Stag
     try:
         import_lots(config, registry, plan.incoming, summary, log)
         scan_barcodes(config, registry, run_stage, summary, log)
+        clean_archive(config, registry, summary)
         run_follow_up(OCR_SCRIPT, "OCR", config, run_stage, summary, log)
         run_follow_up(REVIEW_SCRIPT, "Pending", config, run_stage, summary, log)
     except KeyboardInterrupt:
         summary.interrupted = True
     except (PipelineError, OSError) as exc:
         summary.error = str(exc)
+    try:
+        stale = reporting.pending_updates(root)
+    except (OSError, sqlite3.Error):
+        stale = 0
+    if stale:
+        summary.warnings.append(
+            "Rapports : mise à jour incomplète (interruption, ou fichier ouvert dans Excel) ; "
+            "elle sera terminée au prochain traitement.")
     summary.review_total = len(pdf_files(root / "Review"))
     summary.review_added = summary.review_total - review_before
     summary.left_ocr = len(pdf_files(root / "OCR"))
     summary.left_pending = len(pdf_files(root / "Pending"))
     summary.seconds = time.perf_counter() - started
     return summary
+
+
+def clean_archive(config: Config, registry: Registry, summary: Summary) -> None:
+    removed, kept = purge_archive(config, registry)
+    summary.archive_removed = removed
+    kept = [name for name in kept if name not in summary.archived]
+    if kept:
+        summary.warnings.append(
+            "Archive : copies conservées car l'original manque ou diffère dans le dossier source : "
+            + ", ".join(kept))
 
 
 def format_summary(summary: Summary) -> str:
@@ -660,6 +764,12 @@ def format_summary(summary: Summary) -> str:
         outcome = {0: "OK", 1: "avertissements", INTERRUPTED_CODE: "interrompue"}.get(result.code, f"erreur {result.code}")
         lines.append(f"  - {result.label} : {outcome} ({barcode.format_duration(result.seconds)})")
     lines.append(f"Dossier Review : +{number(summary.review_added)} page(s), {number(summary.review_total)} au total")
+    if summary.archive_removed:
+        lines.append(f"Archive : {plural(summary.archive_removed, 'copie')} de lot supprimée(s), "
+                     "les originaux sont intacts dans le dossier source")
+    if summary.archived:
+        lines.append("Conservés dans Archive/ (original absent ou modifié dans la source) : "
+                     + ", ".join(summary.archived))
     if summary.left_ocr or summary.left_pending:
         lines.append(f"Restent à traiter : {summary.left_ocr} dans OCR/, {summary.left_pending} dans Pending/")
     for name, reason in summary.skipped:
@@ -673,9 +783,7 @@ def format_summary(summary: Summary) -> str:
     return "\n".join(lines)
 
 
-def save_summary(config: Config, text: str) -> Path:
-    directory = config.root / REPORTS / "pipeline"
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{datetime.now():%Y%m%d_%H%M%S}.txt"
+def save_summary(config: Config, text: str, started_at: datetime | None = None) -> Path:
+    path = reporting.execution_report_path(config.root, started_at or datetime.now(), "pipeline")
     barcode.atomic_text_write(path, lambda handle: handle.write(text.strip() + "\n"), encoding="utf-8")
     return path
