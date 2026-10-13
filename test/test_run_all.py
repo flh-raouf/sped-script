@@ -69,6 +69,27 @@ class RunAllTests(unittest.TestCase):
         opened.assert_not_called()
         self.assertEqual(len(list((self.root / "Reports" / "pipeline").glob("*.txt"))), 1)
 
+    def test_stage_runner_uses_separate_barcode_and_ocr_worker_counts(self):
+        config = pipeline.Config(source=self.source, root=self.root, workers=6, ocr_workers=3)
+        with patch.object(run_all, 'execute_command', return_value=0) as execute:
+            run_stage = run_all.make_stage_runner(config, self.root / 'BDD.xlsx', self.root / 'dirty list.xlsx')
+            for stage in (pipeline.BARCODE_SCRIPT, pipeline.OCR_SCRIPT, pipeline.REVIEW_SCRIPT):
+                self.assertEqual(run_stage(stage), 0)
+        barcode, ocr, review = [call.args[0] for call in execute.call_args_list]
+        self.assertEqual(barcode[barcode.index('-n') + 1], '6')
+        self.assertEqual(ocr[ocr.index('-n') + 1], '3')
+        self.assertNotIn('-n', review)
+
+    def test_unattended_ocr_resume_uses_the_configured_worker_count(self):
+        self.config.write_text(self.config.read_text() + 'processus_ocr = 3\n')
+        (self.root / 'OCR').mkdir()
+        (self.root / 'OCR' / '1_1.pdf').write_bytes(b'%PDF')
+        code, _, _ = self.launch('--yes')
+        self.assertEqual(code, 0)
+        command = self.commands[0]
+        self.assertEqual(Path(command[2]).name, 'ocr_pages.py')
+        self.assertEqual(command[command.index('-n') + 1], '3')
+
     def test_unattended_run_takes_every_new_lot(self):
         self.add_lots("1", "2", "3")
         self.assertEqual(self.launch("--yes")[0], 0)

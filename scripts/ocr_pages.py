@@ -8,15 +8,21 @@ import importlib.metadata
 import json
 import logging
 import math
+import multiprocessing as mp
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import sys
 import tempfile
 import time
 import unicodedata
-from collections import defaultdict
+from collections import defaultdict, deque
+from collections.abc import Iterator
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
+from contextlib import closing
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -26,11 +32,13 @@ if __package__:
     from . import script as barcode
     from . import split_pages as split
     from . import workflow
+    from . import performance
 else:
     import classify_pages as classify
     import script as barcode
     import split_pages as split
     import workflow
+    import performance
 
 DET_MODEL = 'PP-OCRv6_tiny_det'
 REC_MODEL = 'PP-OCRv6_tiny_rec'
@@ -70,12 +78,15 @@ def ocr_settings(dpi: int, device: str) -> dict:
 
 class OcrCache:
     """Cache only successful raw OCR, including empty results; never cache decisions."""
-    def __init__(self, path: Path, settings: dict):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(path)
-        self.connection.execute('PRAGMA journal_mode=WAL')
-        self.connection.execute('PRAGMA synchronous=FULL')
-        self.connection.execute('CREATE TABLE IF NOT EXISTS ocr (key TEXT PRIMARY KEY, payload TEXT NOT NULL)')
+    def __init__(self, path: Path, settings: dict, *, read_only: bool = False):
+        if read_only:
+            self.connection = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.connection = sqlite3.connect(path)
+            self.connection.execute('PRAGMA journal_mode=WAL')
+            self.connection.execute('PRAGMA synchronous=FULL')
+            self.connection.execute('CREATE TABLE IF NOT EXISTS ocr (key TEXT PRIMARY KEY, payload TEXT NOT NULL)')
         self.signature = json.dumps(settings, sort_keys=True, separators=(',', ':'))
 
     def key(self, digest: str) -> str:
@@ -111,14 +122,15 @@ class OcrCache:
 
 
 class PaddleEngine:
-    def __init__(self, dpi: int, device: str):
+    def __init__(self, dpi: int, device: str, *, cpu_threads: int | None = None):
         from paddleocr import PaddleOCR
         self.dpi = dpi
+        options = {} if cpu_threads is None else {'cpu_threads': cpu_threads}
         # Paddle 3.3.x oneDNN can fail converting PIR DoubleAttribute arrays.
         self.model = PaddleOCR(text_detection_model_name=DET_MODEL, text_recognition_model_name=REC_MODEL,
                                use_doc_orientation_classify=False, use_doc_unwarping=False,
                                use_textline_orientation=False, device=device, enable_mkldnn=False,
-                               text_det_limit_side_len=1600, text_det_limit_type='max')
+                               text_det_limit_side_len=1600, text_det_limit_type='max', **options)
 
     def read(self, path: Path) -> list[TextLine]:
         import numpy as np
@@ -151,6 +163,126 @@ class PaddleEngine:
             if page is not None:
                 page.close()
             document.close()
+
+
+def create_engine(dpi: int, device: str, *, cpu_threads: int | None = None) -> PaddleEngine:
+    try:
+        return PaddleEngine(dpi, device, **({} if cpu_threads is None else {'cpu_threads': cpu_threads}))
+    except Exception as exc:
+        raise barcode.ConfigurationError('Cannot initialize PaddleOCR; install requirements-ocr.txt '
+                                         f'and check model download access: {exc}') from exc
+
+
+_worker_engine = None
+_worker_options = None
+_model_lock = None
+
+
+def initialize_worker(dpi, device, model_lock):
+    global _worker_engine, _worker_options, _model_lock
+    # The parent owns interruption, reports and transfers. Let active reads finish.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    _worker_engine = None
+    _worker_options = (dpi, device)
+    _model_lock = model_lock
+
+
+def recognize_page(path: Path) -> tuple[list[TextLine] | None, float, Exception | None]:
+    global _worker_engine
+    started = time.perf_counter()
+    if _worker_engine is None:
+        # Avoid simultaneous downloads into Paddle's shared model directory.
+        with _model_lock:
+            _worker_engine = create_engine(*_worker_options, cpu_threads=1)
+    lines = error = None
+    try:
+        lines = _worker_engine.read(path)
+    except Exception as exc:
+        error = exc
+    return lines, time.perf_counter() - started, error
+
+
+@dataclass
+class OcrPage:
+    path: Path
+    digest: str = ''
+    lines: list[TextLine] | None = None
+    cache_hit: bool = False
+    seconds: float = 0.0
+    error: Exception | None = None
+    input_bytes: int = 0
+
+
+def read_pages(files: list[Path], cache: OcrCache, dpi: int, device: str, workers: int) -> Iterator[OcrPage]:
+    """Bound the in-flight pages and publish in input order; only the parent writes cache."""
+    pending = deque()
+    remaining = iter(files)
+    exhausted = False
+    pool = engine = None
+    try:
+        while pending or not exhausted:
+            while not exhausted and len(pending) < workers:
+                path = next(remaining, None)
+                if path is None:
+                    exhausted = True
+                    break
+                page = OcrPage(path)
+                task = None
+                started = time.perf_counter()
+                try:
+                    page.input_bytes = path.stat().st_size
+                    page.digest = file_digest(path)
+                    page.lines = cache.get(page.digest)
+                    page.cache_hit = page.lines is not None
+                    if not page.cache_hit and workers > 1:
+                        if pool is None:
+                            context = mp.get_context('spawn')
+                            pool = ProcessPoolExecutor(
+                                max_workers=workers, mp_context=context,
+                                initializer=initialize_worker, initargs=(dpi, device, context.Lock()))
+                        task = pool.submit(recognize_page, path)
+                except BrokenProcessPool:
+                    raise
+                except Exception as exc:
+                    page.error = exc
+                page.seconds = time.perf_counter() - started
+                pending.append((page, task))
+
+            if not pending:
+                break
+            page, task = pending.popleft()
+            if page.error is None and not page.cache_hit:
+                try:
+                    if task is not None:
+                        page.lines, seconds, page.error = task.result()
+                        page.seconds += seconds
+                    else:
+                        started = time.perf_counter()
+                        if engine is None:
+                            engine = create_engine(dpi, device)
+                        try:
+                            page.lines = engine.read(page.path)
+                        finally:
+                            page.seconds += time.perf_counter() - started
+                    if page.error is None:
+                        started = time.perf_counter()
+                        try:
+                            if file_digest(page.path) != page.digest:
+                                raise RuntimeError('Source changed during OCR; no cache entry saved')
+                            cache.put(page.digest, page.lines)
+                        finally:
+                            page.seconds += time.perf_counter() - started
+                except (barcode.ConfigurationError, BrokenProcessPool):
+                    raise
+                except Exception as exc:
+                    page.error = exc
+            yield page
+    except BrokenProcessPool as exc:
+        raise barcode.ConfigurationError('An OCR worker stopped unexpectedly; untransferred source '
+                                         'PDFs were retained. Check available memory before retrying.') from exc
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
 
 
 def document_sequence(record: classify.VehicleRecord) -> str | None:
@@ -359,82 +491,83 @@ def run(args) -> int:
     handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
     logger.addHandler(handler)
     cache = OcrCache((args.cache or paths.cache).expanduser(), ocr_settings(args.dpi, args.device))
-    engine = None
+    workers = min(args.workers, len(files))
     hits = recovered = review = errors = attempted = 0
+    input_bytes = 0
     classify.save_csv(reports / 'results.csv',
                       (*classify.PAGE_HEADERS, 'SEQ_DOC', 'Status', 'Cache', 'Seconds', 'Source', 'PDF', 'Error'), [])
-    logger.info('Folder START | %s | input=%s | models=%s/%s | pages=%d',
-                started_at.isoformat(), source, DET_MODEL, REC_MODEL, len(files))
+    logger.info('Folder START | %s | input=%s | models=%s/%s | pages=%d | workers=%d',
+                started_at.isoformat(), source, DET_MODEL, REC_MODEL, len(files), workers)
+    print(f'OCR | pages={len(files)} | workers={workers}', flush=True)
     def summary(status):
         elapsed = time.perf_counter() - started
         text = (f'Status: {status}\nStart: {started_at.isoformat()}\n'
                 f'Updated: {datetime.now().astimezone().isoformat()}\n'
                 f'Total duration: {barcode.format_duration(elapsed)} ({elapsed:.3f} seconds)\n'
                 f'Pages attempted: {attempted}/{len(files)}\nRecovered: {recovered}\n'
+                f'Workers: {workers}\n'
                 f'{paths.unresolved.name}: {review}\n'
                 f'OCR cache hits: {hits}\nErrors: {errors}\nBDD: {database_path}\n')
         barcode.atomic_text_write(reports / 'report.txt', lambda handle: handle.write(text))
     try:
         summary('RUNNING')
-        for path in files:
-            page_started = time.perf_counter()
-            destination = None
-            enriched = (path.stem, '', '', '', '', '', '')
-            decision = Decision(None, 'ERROR')
-            hit = False
-            error = ''
-            try:
-                digest = file_digest(path)
-                lines = cache.get(digest)
-                hit = lines is not None
-                if hit:
-                    hits += 1
-                else:
-                    if engine is None:
-                        try:
-                            engine = PaddleEngine(args.dpi, args.device)
-                        except Exception as exc:
-                            raise barcode.ConfigurationError('Cannot initialize PaddleOCR; install requirements-ocr.txt '
-                                                             f'and check model download access: {exc}') from exc
-                    lines = engine.read(path)
-                    if file_digest(path) != digest:
-                        raise RuntimeError('Source changed during OCR; no cache entry saved')
-                    cache.put(digest, lines)
-                decision = resolve_text(lines, lookup, args.min_score)
-                enriched = enriched_row(path.stem, decision, lookup.database)
-                destination = (output/decision.vis if decision.vis else paths.unresolved) / path.name
-                # Durable intent precedes the move: an interruption cannot erase the page's mapping.
-                with (reports / 'transfers.jsonl').open('a', encoding='utf-8') as journal:
-                    journal.write(json.dumps({'source': str(path), 'destination': str(destination),
-                                              'sha256': digest, 'row': enriched,
-                                              'decision': asdict(decision)}, ensure_ascii=False) + '\n')
-                    journal.flush()
-                    os.fsync(journal.fileno())
-                transfer_page(path, destination, digest, args.copy)
-                recovered += bool(decision.vis)
-                review += not bool(decision.vis)
-            except barcode.ConfigurationError:
-                raise
-            except Exception as exc:
-                errors += 1
-                error = f'{type(exc).__name__}: {exc}'
-                logger.exception('Page %s | ERROR | source retained when transfer fails', path.name)
-            attempted += 1
-            elapsed = time.perf_counter() - page_started
-            classify.append_lot_csv(reports / 'results.csv', [(*enriched, ';'.join(decision.sequences),
-                                    'ERROR' if error else decision.reason, 'HIT' if hit else 'MISS',
-                                    f'{elapsed:.3f}', str(path), str(destination or ''), error)])
-            logger.info('Page %s | %s | cache=%s | duration=%.3fs | destination=%s',
-                        path.name, 'ERROR' if error else decision.reason, 'HIT' if hit else 'MISS', elapsed, destination)
-            print(f'{attempted}/{len(files)} | {path.name} | {"ERROR" if error else decision.reason} | '
-                  f'cache={"HIT" if hit else "MISS"} | {elapsed:.3f}s', flush=True)
-            summary('RUNNING')
+        setup_seconds = time.perf_counter() - started
+        with closing(read_pages(files, cache, args.dpi, args.device, workers)) as pages:
+            for page in pages:
+                input_bytes += page.input_bytes
+                path = page.path
+                page_started = time.perf_counter()
+                destination = None
+                enriched = (path.stem, '', '', '', '', '', '')
+                decision = Decision(None, 'ERROR')
+                hit = page.cache_hit
+                error = ''
+                try:
+                    if page.error is not None:
+                        raise page.error
+                    digest, lines = page.digest, page.lines
+                    if hit:
+                        hits += 1
+                    decision = resolve_text(lines, lookup, args.min_score)
+                    enriched = enriched_row(path.stem, decision, lookup.database)
+                    destination = (output/decision.vis if decision.vis else paths.unresolved) / path.name
+                    # Durable intent precedes the move: an interruption cannot erase the page's mapping.
+                    with (reports / 'transfers.jsonl').open('a', encoding='utf-8') as journal:
+                        journal.write(json.dumps({'source': str(path), 'destination': str(destination),
+                                                  'sha256': digest, 'row': enriched,
+                                                  'decision': asdict(decision)}, ensure_ascii=False) + '\n')
+                        journal.flush()
+                        os.fsync(journal.fileno())
+                    transfer_page(path, destination, digest, args.copy)
+                    recovered += bool(decision.vis)
+                    review += not bool(decision.vis)
+                except barcode.ConfigurationError:
+                    raise
+                except Exception as exc:
+                    errors += 1
+                    error = f'{type(exc).__name__}: {exc}'
+                    logger.exception('Page %s | ERROR | source retained when transfer fails', path.name)
+                attempted += 1
+                elapsed = page.seconds + time.perf_counter() - page_started
+                classify.append_lot_csv(reports / 'results.csv', [(*enriched, ';'.join(decision.sequences),
+                                        'ERROR' if error else decision.reason, 'HIT' if hit else 'MISS',
+                                        f'{elapsed:.3f}', str(path), str(destination or ''), error)])
+                logger.info('Page %s | %s | cache=%s | duration=%.3fs | destination=%s',
+                            path.name, 'ERROR' if error else decision.reason, 'HIT' if hit else 'MISS', elapsed, destination)
+                print(f'{attempted}/{len(files)} | {path.name} | {"ERROR" if error else decision.reason} | '
+                      f'cache={"HIT" if hit else "MISS"} | {elapsed:.3f}s', flush=True)
+                summary('RUNNING')
         import csv
         with (reports / 'results.csv').open(encoding='utf-8-sig', newline='') as handle:
             rows = csv.reader(handle)
             next(rows)
             classify.write_page_workbook(reports / 'pages.xlsx', (tuple(row[:7]) for row in rows))
         summary('COMPLETED_WITH_ERRORS' if errors else 'COMPLETED')
+        if not errors:
+            performance.record(reports, 'ocr', workers=0 if hits == attempted else workers,
+                               pages=attempted, seconds=time.perf_counter() - started,
+                               setup_seconds=setup_seconds, input_bytes=input_bytes,
+                               cache_hits=hits, unresolved=review, args=args)
         logger.info('Folder FINISHED | duration=%.3fs | recovered=%d | review=%d | cache hits=%d',
                     time.perf_counter() - started, recovered, review, hits)
         print(f'Finished | VIS={recovered} | {paths.unresolved.name}={review} | '
@@ -457,10 +590,14 @@ def parse_args(argv=None):
     parser.add_argument('--database', type=Path)
     parser.add_argument('--cache', type=Path, help='Persistent raw OCR SQLite cache')
     parser.add_argument('--copy', action='store_true', help='Keep original PDFs instead of moving them')
+    parser.add_argument('-n', '--workers', type=int, default=1,
+                        help='OCR processes (default: 1; each process loads its own model)')
     parser.add_argument('--dpi', type=int, default=200)
     parser.add_argument('--device', default='cpu')
     parser.add_argument('--min-score', type=float, default=.8)
     args = parser.parse_args(argv)
+    if args.workers <= 0:
+        parser.error('Workers must be greater than zero')
     if args.dpi < 72 or not 0 <= args.min_score <= 1:
         parser.error('DPI must be >=72 and min-score between 0 and 1')
     return args

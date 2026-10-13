@@ -348,6 +348,7 @@ def run(args):
     log(f'Folder START | {source} | {len(files)} pages | dry-run={args.dry_run}')
     try:
         summary('RUNNING')
+        setup_seconds = time.perf_counter() - started
         for path in files:
             page_started = time.perf_counter()
             decision = ocr.Decision(None, 'ERROR')
@@ -423,6 +424,10 @@ def run(args):
             next(reader)
             classify.write_page_workbook(reports / 'pages.xlsx', (tuple(row[:7]) for row in reader))
         summary('COMPLETED_WITH_ERRORS' if errors else 'COMPLETED')
+        if not errors and not args.dry_run:
+            ocr.performance.record(reports, 'review', workers=1, pages=attempted,
+                                   seconds=time.perf_counter() - started, setup_seconds=setup_seconds,
+                                   cache_hits=hits, unresolved=attempted-recovered, args=args)
         log(f'Folder FINISHED | duration={time.perf_counter()-started:.3f}s | '
             f'recovered={recovered} | errors={errors} | reports={reports}')
         return 1 if errors else 0

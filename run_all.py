@@ -39,7 +39,8 @@ def choose_lots(catalog, interactive: bool) -> list[str] | None:
 
 def make_stage_runner(config: pipeline.Config, database: Path, search_list: Path) -> pipeline.StageRunner:
     def run_stage(script: str) -> int:
-        command = build_command(script, config.root, workers=config.workers,
+        workers = config.ocr_workers if script == pipeline.OCR_SCRIPT else config.workers
+        command = build_command(script, config.root, workers=workers,
                                 excel=search_list, database=database)
         return execute_command(command)
     return run_stage

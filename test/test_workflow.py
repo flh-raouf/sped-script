@@ -14,6 +14,7 @@ from test_split_pages import make_pdf
 from scripts import classify_pages as classify
 from scripts import ocr_pages as ocr
 from scripts import review_pages as review
+from scripts import performance
 
 
 class ParentWorkflowTests(unittest.TestCase):
@@ -79,6 +80,13 @@ class ParentWorkflowTests(unittest.TestCase):
             self.assertEqual(len(list((root/'Output'/VIS).glob('*.pdf'))), 4)
             self.assertTrue((root/'Review/1_5.pdf').exists())
             self.assertTrue((root/'Reports/review_assignments.jsonl').exists())
+            for stage, pages, unresolved in [('barcode', 5, 4), ('ocr', 4, 3), ('review', 3, 1)]:
+                settings = performance.options(stage)
+                if stage == 'review':
+                    settings['cache_only'] = True
+                history = performance.history(root, stage, settings)
+                self.assertEqual(len(history), 1, stage)
+                self.assertEqual((history[0].pages, history[0].unresolved), (pages, unresolved))
             results = next((root/'Reports/review').glob('*/results.csv'))
             with results.open(encoding='utf-8-sig', newline='') as handle:
                 rows = {row['lot_page']: row for row in csv.DictReader(handle)}

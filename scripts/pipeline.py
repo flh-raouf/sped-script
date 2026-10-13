@@ -12,6 +12,7 @@ import csv
 import fcntl
 import hashlib
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -25,6 +26,7 @@ from pathlib import Path
 
 from . import script as barcode
 from . import split_pages as split
+from . import performance
 from .classify_pages import discover_database
 from .lot_catalog import CatalogLot, Ranges, Status, find_gaps, format_ranges, in_ranges, parse_ranges
 
@@ -65,6 +67,9 @@ class Config:
     ocr_seconds_per_page: float = 3.0
     ocr_share: float = 0.5
     already_done: Ranges = ()   # lots processed before this tool kept a registry
+    ocr_workers: int = 1
+    copy_megabytes_per_second: float = 30.0
+    review_seconds_per_page: float = .2
 
 
 def load_config(path: Path) -> Config:
@@ -83,15 +88,22 @@ def load_config(path: Path) -> Config:
     workers = processing.get("processus", Config.workers)
     if not isinstance(workers, int) or isinstance(workers, bool) or workers <= 0:
         raise PipelineError("config.toml : [traitement] processus doit être un entier supérieur à zéro.")
+    ocr_workers = processing.get("processus_ocr", Config.ocr_workers)
+    if not isinstance(ocr_workers, int) or isinstance(ocr_workers, bool) or ocr_workers <= 0:
+        raise PipelineError("config.toml : [traitement] processus_ocr doit être un entier supérieur à zéro.")
     numbers = {
         "stable_seconds": processing.get("attente_stabilite", Config.stable_seconds),
         "barcode_seconds_per_page": estimate.get("codes_barres", Config.barcode_seconds_per_page),
         "ocr_seconds_per_page": estimate.get("ocr", Config.ocr_seconds_per_page),
         "ocr_share": estimate.get("part_ocr", Config.ocr_share),
+        "copy_megabytes_per_second": estimate.get("copie_mo_par_seconde", Config.copy_megabytes_per_second),
+        "review_seconds_per_page": estimate.get("classification", Config.review_seconds_per_page),
     }
     for name, value in numbers.items():
-        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
             raise PipelineError(f"config.toml : valeur invalide pour {name} ({value!r}).")
+    if numbers['ocr_share'] > 1 or numbers['copy_megabytes_per_second'] <= 0:
+        raise PipelineError('config.toml : part_ocr doit être entre 0 et 1 et copie_mo_par_seconde supérieure à zéro.')
     done = processing.get("deja_traites", "")
     try:
         if not isinstance(done, str):
@@ -101,7 +113,8 @@ def load_config(path: Path) -> Config:
         raise PipelineError(f"config.toml : [traitement] deja_traites : {exc}.") from exc
     return Config(
         source=Path(folders["source"]).expanduser(), root=Path(folders["racine"]).expanduser(),
-        workers=workers, database=processing.get("bdd"), search_list=processing.get("liste"),
+        workers=workers, ocr_workers=ocr_workers,
+        database=processing.get("bdd"), search_list=processing.get("liste"),
         already_done=already_done, **{name: float(value) for name, value in numbers.items()})
 
 
@@ -415,13 +428,12 @@ def lots_label(names: list[str]) -> str:
 
 
 def estimate_seconds(plan: Plan, config: Config) -> float:
-    pages = plan.scan_pages
-    barcode_time = pages * config.barcode_seconds_per_page
-    ocr_time = (plan.ocr_files + pages * config.ocr_share) * config.ocr_seconds_per_page
-    return barcode_time + ocr_time
+    return performance.estimate(plan, config, pdf_files).seconds
 
 
 def format_estimate(seconds: float) -> str:
+    if seconds < 60:
+        return f"{max(1, round(seconds))} s"
     minutes = max(1, round(seconds / 60))
     hours, minutes = divmod(minutes, 60)
     return f"{hours} h {minutes:02d} min" if hours else f"{minutes} min"
@@ -450,7 +462,13 @@ def format_plan(plan: Plan, config: Config) -> str:
     for name, reason in plan.skipped:
         lines.append(f"Ignoré : lot {name} ({reason}).")
     if not plan.idle:
-        lines.append(f"Durée estimée : environ {format_estimate(estimate_seconds(plan, config))} (approximatif).")
+        estimate = performance.estimate(plan, config, pdf_files)
+        lines.append(f"Durée estimée : environ {format_estimate(estimate.seconds)} "
+                     f"(fourchette indicative : {format_estimate(estimate.low)} à {format_estimate(estimate.high)}).")
+        if estimate.notes:
+            lines.append('À calibrer : ' + ' ; '.join(estimate.notes) + '.')
+        else:
+            lines.append('Estimation basée sur les exécutions comparables de ce PC, aux mêmes nombres de processus.')
     return "\n".join(lines)
 
 
@@ -486,6 +504,7 @@ class Summary:
 
 def import_lots(config: Config, registry: Registry, lots: list[LotInfo], summary: Summary, log) -> None:
     """Copy each lot privately, check its size, then publish it with one rename."""
+    started = time.perf_counter()
     for index, lot in enumerate(lots, 1):
         log(f"Copie du lot {lot.name} ({index}/{len(lots)})…")
         stage = config.root / f".import_{lot.name}"
@@ -502,6 +521,16 @@ def import_lots(config: Config, registry: Registry, lots: list[LotInfo], summary
             raise
         registry.record_import(lot.name, lot.pdf.name, lot.size)
         summary.imported.append(lot.name)
+    if lots:
+        directory = config.root / REPORTS / 'import' / datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        try:
+            directory.mkdir(parents=True)
+        except OSError as exc:
+            log(f'Historique des durées de copie non enregistré : {exc}')
+        else:
+            performance.record(directory, 'import', workers=1, pages=sum(lot.pages for lot in lots),
+                               seconds=time.perf_counter() - started, lots=len(lots),
+                               input_bytes=sum(lot.size for lot in lots), source=config.source)
 
 
 def archive_lot(config: Config, registry: Registry, name: str) -> None:

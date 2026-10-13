@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import csv
+import json
+import multiprocessing as mp
+import os
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
+from contextlib import closing
 from unittest.mock import patch
 
 from test_split_pages import make_pdf
@@ -28,6 +33,53 @@ def database():
                                   {VIS: [record], 'S5780509': [other]})
 
 
+class SpawnEngine:
+    """Importable OCR stand-in: exercise real spawn workers without model downloads."""
+    def __init__(self, dpi, device, *, cpu_threads):
+        if cpu_threads != 1:
+            raise AssertionError('Parallel workers must limit inference threads')
+        self.identity = id(self)
+
+    def read(self, path):
+        event = {'pid': os.getpid(), 'engine': self.identity, 'start': time.monotonic()}
+        path.with_suffix('.started').write_text(json.dumps(event))
+        if path.stem == 'crash':
+            os._exit(17)
+        if path.stem == 'fail':
+            time.sleep(.05)
+            raise RuntimeError('scan failed')
+        if path.stem == 'change':
+            path.write_bytes(b'changed during OCR')
+        if path.stem in {'1_1', '1_2'} and all((path.parent / f'1_{i}.pdf').exists() for i in (1, 2)):
+            other = path.parent / ('1_2.started' if path.stem == '1_1' else '1_1.started')
+            deadline = time.monotonic() + 10
+            while not other.exists():
+                if time.monotonic() > deadline:
+                    raise RuntimeError('The other page did not start concurrently')
+                time.sleep(.01)
+            # Force completion out of order to exercise ordered reports.
+            if path.stem == '1_1':
+                time.sleep(.15)
+        event['end'] = time.monotonic()
+        path.with_suffix('.finished').write_text(json.dumps(event))
+        return [line('BDG: 91034')] if path.stem == '1_1' else []
+
+
+def initialize_fake_worker(dpi, device, model_lock):
+    ocr.initialize_worker(dpi, device, model_lock)
+    ocr.PaddleEngine = SpawnEngine
+
+
+class BrokenEngine:
+    def __init__(self, *args, **kwargs):
+        raise RuntimeError('model unavailable')
+
+
+def initialize_broken_worker(dpi, device, model_lock):
+    ocr.initialize_worker(dpi, device, model_lock)
+    ocr.PaddleEngine = BrokenEngine
+
+
 class EngineTests(unittest.TestCase):
     def test_cpu_engine_avoids_unsupported_onednn_backend(self):
         def create_model(**options):
@@ -40,6 +92,13 @@ class EngineTests(unittest.TestCase):
         with patch.dict('sys.modules', {'paddleocr': module}):
             engine = ocr.PaddleEngine(200, 'cpu')
         self.assertIsNotNone(engine.model)
+
+    def test_parallel_engine_passes_the_inference_thread_limit(self):
+        module = types.ModuleType('paddleocr')
+        with patch.dict('sys.modules', {'paddleocr': module}), \
+                patch.object(module, 'PaddleOCR', create=True) as model:
+            ocr.PaddleEngine(200, 'cpu', cpu_threads=1)
+        self.assertEqual(model.call_args.kwargs['cpu_threads'], 1)
 
 
 class CacheTests(unittest.TestCase):
@@ -162,7 +221,7 @@ class TransferTests(unittest.TestCase):
             self.assertEqual(destination.read_bytes(), b'concurrent')
 
 
-class BatchTests(unittest.TestCase):
+class BatchFixture:
     def create_batch(self, root):
         from openpyxl import Workbook
         source = root / 'unresolved'
@@ -177,6 +236,8 @@ class BatchTests(unittest.TestCase):
         workbook.close()
         return source, bdd
 
+
+class BatchTests(BatchFixture, unittest.TestCase):
     def test_progressive_outputs_cache_hits_and_changed_bdd_reenrichment(self):
         from openpyxl import load_workbook
         with tempfile.TemporaryDirectory() as directory:
@@ -221,11 +282,142 @@ class BatchTests(unittest.TestCase):
             self.assertIsNone(cache.get(ocr.file_digest(source / '1_1.pdf')))
             self.assertEqual(cache.get(ocr.file_digest(source / '1_2.pdf')), [])
             cache.close()
+            self.assertFalse(list((root / 'ocr_runs').glob('*/performance.json')))
 
     def test_menu_launches_ocr_with_explicit_destination(self):
-        command = main.build_command('ocr_pages.py', Path('/unresolved'), output=Path('/vis-root'))
+        command = main.build_command('ocr_pages.py', Path('/unresolved'), workers=3, output=Path('/vis-root'))
         self.assertEqual(command[-2:], ['--output', '/vis-root'])
-        self.assertNotIn('-n', command)
+        self.assertEqual(command[command.index('-n') + 1], '3')
+
+    def test_worker_count_must_be_positive(self):
+        for count in ('0', '-1', '1.5'):
+            with self.subTest(count=count), self.assertRaises(SystemExit):
+                ocr.parse_args(['-d', '/root', '-n', count])
+        with self.assertRaises(ValueError):
+            main.build_command('ocr_pages.py', Path('/root'), workers=0)
+
+
+class ParallelBatchTests(BatchFixture, unittest.TestCase):
+    def run_parallel(self, source, *options):
+        args = ocr.parse_args(['--legacy-layout', '-d', str(source), '-n', '2', *options])
+        with patch.object(ocr, 'initialize_worker', initialize_fake_worker):
+            return ocr.run(args)
+
+    def test_real_spawn_workers_overlap_and_reports_stay_ordered(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, _ = self.create_batch(root)
+            self.assertEqual(self.run_parallel(source, '--copy'), 0)
+            events = [json.loads((source / f'1_{i}.finished').read_text()) for i in (1, 2)]
+            self.assertNotEqual(events[0]['pid'], events[1]['pid'])
+            self.assertLess(max(event['start'] for event in events), min(event['end'] for event in events))
+            self.assertLess(events[1]['end'], events[0]['end'])
+            reports = next((root / 'ocr_runs').iterdir())
+            with (reports / 'results.csv').open(encoding='utf-8-sig', newline='') as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual([row['lot_page'] for row in rows], ['1_1', '1_2'])
+            self.assertEqual([row['VIS'] for row in rows], [VIS, ''])
+            self.assertIn('Workers: 2', (reports / 'report.txt').read_text())
+            self.assertTrue((reports / 'pages.xlsx').is_file())
+            self.assertTrue((root / VIS / '1_1.pdf').is_file())
+            self.assertTrue((root / 'Review' / '1_2.pdf').is_file())
+            # Changing worker count does not invalidate the persistent cache.
+            with patch.object(ocr, 'ProcessPoolExecutor', side_effect=AssertionError('No pool for cache hits')):
+                self.assertEqual(self.run_parallel(source, '--copy'), 0)
+
+    def test_workers_reuse_their_model_and_submission_is_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            files = []
+            for i in range(8):
+                path = root / f'page_{i}.pdf'
+                path.write_bytes(str(i).encode())
+                files.append(path)
+            cache = ocr.OcrCache(root / 'cache.sqlite3', {})
+            self.addCleanup(cache.close)
+            with patch.object(ocr, 'initialize_worker', initialize_fake_worker):
+                pages = list(ocr.read_pages(files, cache, 200, 'cpu', 2))
+            self.assertTrue(all(page.error is None for page in pages))
+            events = [json.loads(path.read_text()) for path in root.glob('*.finished')]
+            identities = {(event['pid'], event['engine']) for event in events}
+            self.assertLessEqual(len(identities), 2)
+            self.assertLess(len(identities), len(events))
+            for path in root.glob('*.started'):
+                path.unlink()
+            for path in root.glob('*.finished'):
+                path.unlink()
+            # Closing after the first result must not have scheduled every page.
+            fresh = ocr.OcrCache(root / 'fresh.sqlite3', {})
+            self.addCleanup(fresh.close)
+            with patch.object(ocr, 'initialize_worker', initialize_fake_worker), \
+                    closing(ocr.read_pages(files, fresh, 200, 'cpu', 2)) as limited:
+                next(limited)
+            self.assertLessEqual(len(list(root.glob('*.started'))), 2)
+
+    def test_page_errors_and_source_changes_are_not_cached(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, _ = self.create_batch(root)
+            (source / '1_1.pdf').rename(source / 'fail.pdf')
+            (source / '1_2.pdf').rename(source / 'change.pdf')
+            make_pdf(source / 'okay.pdf', ['unidentified but readable'])
+            original_digest = ocr.file_digest(source / 'change.pdf')
+            self.assertEqual(self.run_parallel(source), 1)
+            self.assertTrue((source / 'fail.pdf').is_file())
+            self.assertTrue((source / 'change.pdf').is_file())
+            cache = ocr.OcrCache(root / '.ocr_cache.sqlite3', ocr.ocr_settings(200, 'cpu'))
+            self.addCleanup(cache.close)
+            self.assertIsNone(cache.get(original_digest))
+            self.assertIsNone(cache.get(ocr.file_digest(source / 'fail.pdf')))
+            with next((root / 'ocr_runs').glob('*/results.csv')).open(encoding='utf-8-sig') as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual([row['Status'] for row in rows], ['ERROR', 'ERROR', 'NO_RELIABLE_IDENTIFIER'])
+            self.assertTrue(any('Source changed' in row['Error'] for row in rows))
+            failed = next(row for row in rows if row['lot_page'] == 'fail')
+            self.assertGreaterEqual(float(failed['Seconds']), .05)
+            self.assertTrue((root / 'Review' / 'okay.pdf').is_file())
+
+    def test_model_initialization_failure_stops_run_and_preserves_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, _ = self.create_batch(root)
+            args = ocr.parse_args(['--legacy-layout', '-d', str(source), '-n', '2'])
+            with patch.object(ocr, 'initialize_worker', initialize_broken_worker), \
+                    self.assertRaisesRegex(ocr.barcode.ConfigurationError, 'Cannot initialize.*model unavailable'):
+                ocr.run(args)
+            self.assertEqual(len(list(source.glob('*.pdf'))), 2)
+            self.assertIn('Status: FAILED', next((root / 'ocr_runs').glob('*/report.txt')).read_text())
+
+    def test_worker_crash_stops_run_without_hanging_or_moving_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, _ = self.create_batch(root)
+            (source / '1_1.pdf').rename(source / 'crash.pdf')
+            with self.assertRaisesRegex(ocr.barcode.ConfigurationError, 'worker stopped unexpectedly'):
+                self.run_parallel(source)
+            self.assertEqual(len(list(source.glob('*.pdf'))), 2)
+            self.assertIn('Status: FAILED', next((root / 'ocr_runs').glob('*/report.txt')).read_text())
+
+    def test_interruption_keeps_published_reports_and_joins_workers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, _ = self.create_batch(root)
+            original_append = classify.append_lot_csv
+            def interrupt_after_save(*args):
+                original_append(*args)
+                raise KeyboardInterrupt
+            children_before = {child.pid for child in mp.active_children()}
+            with patch.object(classify, 'append_lot_csv', side_effect=interrupt_after_save), \
+                    self.assertRaises(KeyboardInterrupt):
+                self.run_parallel(source)
+            self.assertTrue((root / VIS / '1_1.pdf').is_file())
+            self.assertFalse((source / '1_1.pdf').exists())
+            self.assertTrue((source / '1_2.pdf').is_file())
+            report = next((root / 'ocr_runs').glob('*/report.txt'))
+            self.assertIn('Status: INTERRUPTED', report.read_text())
+            with (report.parent / 'results.csv').open(encoding='utf-8-sig') as handle:
+                self.assertEqual([row['lot_page'] for row in csv.DictReader(handle)], ['1_1'])
+            self.assertEqual({child.pid for child in mp.active_children()}, children_before)
 
 
 if __name__ == '__main__':

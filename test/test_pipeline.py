@@ -79,6 +79,15 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual((config.source, config.root, config.workers), (Path("/a"), Path("/b"), 8))
         self.assertEqual((config.search_list, config.database, config.ocr_seconds_per_page), ("dirty.xlsx", None, 2.0))
         self.assertEqual(config.already_done, ())
+        self.assertEqual(config.ocr_workers, 1)
+
+    def test_ocr_worker_count_is_independent_and_positive(self):
+        base = '[dossiers]\nsource = "/a"\nracine = "/b"\n[traitement]\nprocessus = 6\n'
+        config = pipeline.load_config(self.write(base + 'processus_ocr = 3\n'))
+        self.assertEqual((config.workers, config.ocr_workers), (6, 3))
+        for value in ('0', '-1', 'true', '2.5', '"3"'):
+            with self.subTest(value=value), self.assertRaisesRegex(PipelineError, 'processus_ocr'):
+                pipeline.load_config(self.write(base + f'processus_ocr = {value}\n'))
 
     def test_lots_processed_before_the_registry_are_declared_as_ranges(self):
         config = pipeline.load_config(self.write(
@@ -302,7 +311,8 @@ class FormattingTests(PipelineTestCase):
 
     def test_estimate_for_a_run_of_7446_pages(self):
         plan = pipeline.Plan(incoming=[pipeline.LotInfo("1", Path("x"), 1, 7446)])
-        self.assertEqual(pipeline.format_estimate(pipeline.estimate_seconds(plan, self.config)), "3 h 43 min")
+        # Includes the sequential final classification, previously omitted.
+        self.assertEqual(pipeline.format_estimate(pipeline.estimate_seconds(plan, self.config)), "3 h 56 min")
 
     def test_pdf_files_ignores_hidden_files_other_extensions_and_folders(self):
         add_pdfs(self.root / "OCR", "1_1.pdf", "2_1.PDF", ".hidden.pdf")
@@ -314,10 +324,12 @@ class FormattingTests(PipelineTestCase):
     def test_estimate_combines_barcode_and_ocr_share(self):
         plan = pipeline.Plan(incoming=[pipeline.LotInfo("1", Path("x"), 1, 1000)], ocr_files=100)
         config = Config(source=self.source, root=self.root, workers=2)
-        # 1000 pages * 0.3 s, then (100 waiting + half of the 1000 pages) * 3 s
-        self.assertEqual(pipeline.estimate_seconds(plan, config), 300 + 1800)
+        # Barcode + OCR + final classification; no invented worker speedup before calibration.
+        self.assertAlmostEqual(pipeline.estimate_seconds(plan, config), 300 + 1800 + 120)
         self.assertEqual(pipeline.format_estimate(2100), "35 min")
         self.assertEqual(pipeline.format_estimate(56000), "15 h 33 min")
+        self.assertEqual(pipeline.format_estimate(4.8), "5 s")
+        self.assertEqual(pipeline.format_estimate(.17), "1 s")
 
     def test_idle_plan_has_no_estimate(self):
         self.assertNotIn("Durée estimée", pipeline.format_plan(pipeline.Plan(), self.config))

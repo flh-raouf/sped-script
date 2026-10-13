@@ -21,9 +21,11 @@ from pathlib import Path
 if __package__:
     from . import script as barcode
     from . import split_pages as split
+    from . import performance
 else:
     import script as barcode
     import split_pages as split
+    import performance
 
 
 @dataclass(frozen=True)
@@ -250,6 +252,8 @@ class LotRun:
     published: bool = False
     issues: list[str] = field(default_factory=list)
     work: Path | None = None
+    input_bytes: int = 0
+    scan_errors: int = 0
 
 
 def save_csv(path: Path, headers: Iterable[str], rows: Iterable[Iterable[object]]) -> None:
@@ -283,6 +287,7 @@ def process_lot(lot: Path, state: LotRun, pool, database: DatabaseIndex,
     pdf, error = split.discover_lot_pdf(lot)
     if error:
         raise ValueError(error)
+    state.input_bytes = pdf.stat().st_size
     work = state.work
     pending = work / '_pending'
     pending.mkdir()
@@ -304,6 +309,7 @@ def process_lot(lot: Path, state: LotRun, pool, database: DatabaseIndex,
     logger.info('Lot %s | SCAN START | pages=%d', lot.name, state.planned_pages)
     records, page_rows, matches = [], [], set()
     for result in pool.imap_unordered(scan_single_page, tasks, chunksize=1):
+        state.scan_errors += bool(result.error)
         vis, status = resolve_vis(result, database.badge_vis)
         name = f'{result.lot}_{result.page_number}.pdf'
         destination = work / (vis or 'OCR')
@@ -498,6 +504,7 @@ def run(args: argparse.Namespace) -> int:
     try:
         save_csv(output / 'results.csv', CSV_HEADERS, [])
         update_report()
+        setup_seconds = time.perf_counter() - started_clock
         with mp.get_context('spawn').Pool(args.workers, initializer=barcode.initialize_worker) as pool:
             for lot in lots:
                 active = LotRun(lot.name, datetime.now().astimezone(), time.perf_counter())
@@ -541,6 +548,12 @@ def run(args: argparse.Namespace) -> int:
         elapsed = time.perf_counter() - started_clock
         duration = barcode.format_duration(elapsed)
         update_report('COMPLETED_WITH_ISSUES' if issues else 'COMPLETED', finished_at, elapsed)
+        if all(state.published and not state.scan_errors for state in states):
+            performance.record(output, 'barcode', workers=args.workers,
+                               pages=sum(state.processed_pages for state in states), seconds=elapsed,
+                               setup_seconds=setup_seconds, lots=len(states),
+                               input_bytes=sum(state.input_bytes for state in states),
+                               unresolved=sum(state.ocr for state in states), args=args)
         logger.info('Batch finished: %s | total processing time=%s (%.3f seconds) | lots saved=%d/%d',
                     finished_at.isoformat(timespec='seconds'), duration, elapsed,
                     sum(state.published for state in states), len(lots))

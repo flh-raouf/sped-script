@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from scripts.classify_pages import discover_database
 from scripts.script import ConfigurationError
+from scripts import performance
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent / "scripts"
 ADDITIONAL_ACTION = "Opérations complémentaires"
@@ -59,13 +61,14 @@ def build_command(
         raise ValueError(f"Unknown operation: {script}")
     command = [sys.executable, "-u", str(SCRIPT_DIRECTORY / script),
                "-d", str(directory)]
-    if script == "classify_pages.py":
+    if script in {"classify_pages.py", "ocr_pages.py"}:
         if workers <= 0:
             raise ValueError("Workers must be greater than zero.")
         command.extend(["-n", str(workers)])
+    if script == "classify_pages.py":
         if excel is not None:
             command.extend(["--excel", str(excel)])
-        if script == "classify_pages.py" and database is not None:
+        if database is not None:
             command.extend(["--database", str(database)])
     elif script in {"ocr_pages.py", "review_pages.py"}:
         if database is not None:
@@ -82,9 +85,14 @@ def build_command(
 def execute_command(command: list[str]) -> int:
     # Inherit the terminal so child progress and errors appear immediately.
     # Ctrl+C reaches the child too; wait for it before accepting another action.
+    stage = {'classify_pages.py': 'barcode', 'ocr_pages.py': 'ocr', 'review_pages.py': 'review'}.get(
+        Path(command[2]).name)
+    root = Path(command[command.index('-d') + 1]) if stage else None
+    before = performance.measurement_paths(root, stage) if stage else set()
+    started = time.perf_counter()
     with subprocess.Popen(command, cwd=SCRIPT_DIRECTORY) as process:
         try:
-            return process.wait()
+            code = process.wait()
         except KeyboardInterrupt:
             print("\nStopping operation…", flush=True)
             try:
@@ -93,6 +101,9 @@ def execute_command(command: list[str]) -> int:
                 process.kill()
                 process.wait()
             return 130
+    if stage and code in (0, 1):
+        performance.include_launch_time(root, stage, before, time.perf_counter() - started)
+    return code
 
 
 def main() -> int:
@@ -179,15 +190,15 @@ def main() -> int:
             last_directory = str(directory)
             workers, dry_run, excel, database = 1, False, None, None
             output = None
-            if script == "classify_pages.py":
+            if script in {"classify_pages.py", "ocr_pages.py"}:
                 workers = int(inquirer.text(
                     message="Nombre de processus :", default="1",
                     validate=valid_workers,
                     invalid_message="Saisissez un nombre entier supérieur à zéro.",
                 ).execute())
-                if script == "classify_pages.py":
-                    database = discover_database(directory)
-                    print(f"BDD détectée : {database.name}", flush=True)
+            if script == "classify_pages.py":
+                database = discover_database(directory)
+                print(f"BDD détectée : {database.name}", flush=True)
                 workbooks = sorted(
                     path for path in directory.iterdir()
                     if path.is_file() and path.suffix.lower() in {".xlsx", ".xlsm"}

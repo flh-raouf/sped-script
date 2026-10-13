@@ -50,6 +50,18 @@ shown at the end and the `Review` folder is opened in Explorer. The same command
 works from a WSL terminal: `python run_all.py` (`--yes` takes every new lot and
 skips the list, the confirmation and the final pause, for a scheduled task).
 
+Worker counts are configured independently in `config.toml`:
+
+```toml
+[traitement]
+processus = 6      # barcode processes
+processus_ocr = 2  # OCR processes; defaults to 1 when omitted
+```
+
+The shortcut uses these values through `run_all.py`, including unattended runs
+and resumed OCR stages. Each OCR process loads its own model, so start with a
+small count and increase it according to available CPU cores and memory.
+
 The list shows every lot of the source folder, highest number first: new lots in
 white, lots already processed in green with a check mark (not selectable), and
 lots copied but not finished (yellow, resumed automatically). Nothing is ticked
@@ -92,6 +104,45 @@ Imported lots are recorded in `Reports/pipeline_state.json`, each run's summary
 is saved in `Reports/pipeline/`, and a second simultaneous run is refused.
 While running, Windows is kept from sleeping (best effort, via `powershell.exe`).
 
+The duration estimate learns from completed runs on this PC. Barcode, OCR and
+final classification save `performance.json` alongside their reports; import
+timings are saved under `Reports/import/<timestamp>/`. Failed/interrupted runs,
+OCR runs with page errors and review dry runs do not train the estimator.
+The shared launcher (`main.py` and `run_all.py`) also records Python startup and
+process shutdown time. Direct stage CLI commands record their internal elapsed
+time. Measurements from different hosts, CPU/memory configurations, package
+versions, implementations or relevant stage settings are kept separate.
+
+Worker counts use separate measured profiles: increasing them is never assumed
+to divide the duration proportionally. The estimator matches batch size, the
+number and size of lots, average PDF size and cache-hit fraction. With enough
+comparable runs of different sizes, a robust fit learns the fixed startup cost;
+otherwise it uses observed setup and nearby run durations with wider bounds.
+Whole-stage elapsed times include serial splitting, matching, transfers,
+filesystem waits, workbook exports and the actual parallel throughput. This
+captures CPU/memory contention, ordered OCR publication and the fact that
+barcode lots themselves run sequentially, when those conditions occur in the
+calibration runs. It does not predict unrelated future machine load or failures.
+
+Copy time uses measured bytes and the configured source path. Final classification
+is included as a separate sequential stage, including an existing `Pending/`
+backlog. The proportions sent from barcode to OCR and from OCR to final
+classification are learned from completed reports. Existing OCR/Pending cache
+hits are checked read-only using at most 24 PDFs, 32 MiB and a two-second
+sampling budget checked between files (individual PDFs over 8 MiB are skipped). No model is loaded
+for the estimate, and the whole backlog is not hashed. Newly unresolved OCR
+pages are expected to use the raw OCR cache in final classification.
+
+The screen shows an indicative duration range, widened for sparse history,
+different lot shapes, sampled cache hits and varying routing proportions. It
+is not a guaranteed deadline or a statistical confidence interval for the
+whole job. A new worker count stays explicitly **À calibrer** until comparable
+measurements exist. The first-run baselines remain configurable under
+`[estimation]`: `codes_barres`, `ocr`, `part_ocr`, `copie_mo_par_seconde`
+(MiB/s; default 30) and `classification` (seconds/page; default 0.2). These are
+rough fallbacks, not measured performance claims; the fallback assumes all OCR
+pages may need final classification until the routing proportion is learned.
+
 Tests: `PYTHONPATH=. python -m unittest discover -s test`.
 
 The launcher stays at the project root. All processing utilities and their
@@ -101,8 +152,9 @@ Select **Extraction des codes-barres**, **Extraction par OCR (PP-OCRv6 tiny)**,
 **Classification finale (tableaux de pièces et versos peu renseignés)**, or
 **Opérations complémentaires** with the arrow keys and Enter. The latter opens
 the hidden-file cleanup and PDF page-splitting options. Enter the root folder
-(the last folder is remembered for this session). Barcode extraction asks for
-workers and, when needed, the source workbook. Cleaning defaults to a dry-run
+(the last folder is remembered for this session). Barcode extraction and OCR
+ask for workers; barcode extraction also asks for the source workbook when
+needed. Cleaning defaults to a dry-run
 preview; choose deletion explicitly to remove files. Progress is displayed
 live, and you return to the menu when finished. Ctrl+C cancels a prompt or
 interrupts an operation. The launcher uses the same Python environment as the
@@ -351,6 +403,24 @@ Install the additional OCR dependencies in the environment used to run the scrip
 python -m pip install -r requirements-ocr.txt
 python scripts/ocr_pages.py -d "/path/to/Parent"
 ```
+
+For parallel OCR, choose the process count in `python main.py`, or use:
+
+```bash
+python scripts/ocr_pages.py -d "/path/to/Parent" -n 3
+```
+
+`-n` / `--workers` accepts a positive integer and defaults to 1. Parallel runs
+use spawned processes, one reusable OCR model per process and one inference
+CPU thread per model. Only a bounded number of pages is submitted at a time.
+The parent process checks the cache, saves successful raw OCR, resolves the
+BDD metadata, transfers PDFs and writes reports in numeric page order.
+Changing the worker count does not invalidate the shared OCR cache; a fully
+cached run does not start OCR workers. Ctrl+C stops new submissions, waits for
+active recognition calls to finish and leaves untransferred PDFs for retry.
+If a worker crashes, the stage stops with an error and retains untransferred
+sources. The final classification stage remains sequential because it can
+depend on the preceding page.
 
 Supply the parent root used for barcode classification. Only immediate PDFs
 inside its `OCR/` folder are processed, and each must contain exactly one page.
