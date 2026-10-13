@@ -1,4 +1,4 @@
-"""Estimate wall time from comparable completed runs, without assuming worker scaling."""
+"""Estimate wall time from worker-aware defaults and comparable completed runs."""
 from __future__ import annotations
 
 import hashlib
@@ -245,13 +245,28 @@ def cache_sample(root: Path, stage: str, files: list[Path]) -> CacheSample:
     return CacheSample(hits, checked, len(files), total_bytes / checked if checked else 0)
 
 
+def initial_ocr_seconds(pages: float, workers: int, seconds_per_page: float,
+                        overhead_per_page: float, hit_share: float = 0) -> float:
+    """Before calibration, allow full page waves and serial overhead instead of ideal 1/N time."""
+    if pages <= 0:
+        return 0
+    uncached = pages * (1 - hit_share)
+    if uncached <= 0:
+        return pages * overhead_per_page
+    if workers <= 1:
+        # The existing single-worker baseline already includes its per-page work.
+        return uncached * seconds_per_page + (pages - uncached) * overhead_per_page
+    waves = math.ceil(uncached / workers)
+    return waves * seconds_per_page + pages * overhead_per_page
+
+
 def predict(runs: list[Run], *, pages: float, workers: int, fallback: float,
             lots: int = 0, input_bytes: float = 0, hit_share: float = 0) -> Cost:
     if pages <= 0:
         return Cost(0, 0, 0, True)
     compatible = [run for run in runs if run.workers == workers and abs(run.hit_share - hit_share) <= .2]
     if not compatible:
-        # The configured value is a baseline, not evidence of linear parallel speedup.
+        # The caller supplies the initial baseline; measured profiles take precedence.
         seconds = pages * fallback
         return Cost(seconds, seconds * .5, seconds * 2, False, 'aucune mesure comparable')
 
@@ -335,6 +350,9 @@ def estimate(plan, config, pdf_files) -> Estimate:
         ocr_hits = ocr_hit_share * plan.ocr_files
         review_hits = review_hit_share * plan.pending_files + new_review
         ocr_workers = 0 if ocr_hits == ocr_pages else min(config.ocr_workers, max(1, math.ceil(ocr_pages)))
+        ocr_hit_fraction = ocr_hits / ocr_pages if ocr_pages else 0
+        ocr_default = initial_ocr_seconds(ocr_pages, ocr_workers, config.ocr_seconds_per_page,
+                                          config.ocr_overhead_seconds_per_page, ocr_hit_fraction)
         return {
             'copie': predict(copy_runs, pages=sum(lot.pages for lot in plan.incoming), workers=1,
                             fallback=(plan.incoming_bytes / (config.copy_megabytes_per_second * 1024**2)
@@ -344,10 +362,12 @@ def estimate(plan, config, pdf_files) -> Estimate:
                 barcode_runs, pages=plan.scan_pages, workers=config.workers, fallback=config.barcode_seconds_per_page,
                 lots=len(plan.incoming) + len(plan.waiting), input_bytes=sum(lot.size for lot in (*plan.incoming, *plan.waiting))),
             f'OCR ({config.ocr_workers} processus)': predict(
-                ocr_runs, pages=ocr_pages, workers=ocr_workers, fallback=config.ocr_seconds_per_page,
-                input_bytes=ocr_cache.mean_bytes * ocr_pages, hit_share=ocr_hits / ocr_pages if ocr_pages else 0),
-            'classification finale (séquentielle)': predict(
-                review_runs, pages=review_pages, workers=1, fallback=config.review_seconds_per_page,
+                ocr_runs, pages=ocr_pages, workers=ocr_workers,
+                fallback=ocr_default / ocr_pages if ocr_pages else 0,
+                input_bytes=ocr_cache.mean_bytes * ocr_pages, hit_share=ocr_hit_fraction),
+            f'classification finale ({config.review_workers} processus)': predict(
+                review_runs, pages=review_pages, workers=min(config.review_workers, max(1, math.ceil(review_pages))),
+                fallback=config.review_seconds_per_page,
                 hit_share=review_hits / review_pages if review_pages else 0),
         }
     stages = stage_costs(barcode_share, ocr_share, ocr_cache.share, review_cache.share)

@@ -61,7 +61,7 @@ def build_command(
         raise ValueError(f"Unknown operation: {script}")
     command = [sys.executable, "-u", str(SCRIPT_DIRECTORY / script),
                "-d", str(directory)]
-    if script in {"classify_pages.py", "ocr_pages.py"}:
+    if script in {"classify_pages.py", "ocr_pages.py", "review_pages.py"}:
         if workers <= 0:
             raise ValueError("Workers must be greater than zero.")
         command.extend(["-n", str(workers)])
@@ -96,8 +96,9 @@ def execute_command(command: list[str]) -> int:
         except KeyboardInterrupt:
             print("\nStopping operation…", flush=True)
             try:
-                process.wait(timeout=10)
-            except (subprocess.TimeoutExpired, KeyboardInterrupt):
+                # The stage joins its workers before exiting; a timeout can orphan them.
+                process.wait()
+            except KeyboardInterrupt:
                 process.kill()
                 process.wait()
             return 130
@@ -190,7 +191,7 @@ def main() -> int:
             last_directory = str(directory)
             workers, dry_run, excel, database = 1, False, None, None
             output = None
-            if script in {"classify_pages.py", "ocr_pages.py"}:
+            if script in {"classify_pages.py", "ocr_pages.py", "review_pages.py"}:
                 workers = int(inquirer.text(
                     message="Nombre de processus :", default="1",
                     validate=valid_workers,

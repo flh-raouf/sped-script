@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import csv
 import json
+import multiprocessing as mp
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from test_ocr_pages import VIS, database, line
+from test_ocr_pages import initialize_broken_worker
 from test_split_pages import make_pdf
 
 import main
@@ -22,6 +26,49 @@ def parts_table(badge='91034'):
         y = 110 + 40 * i
         lines.extend((line(value, (10, y, 210, y+20)), line('OK', (300, y, 340, y+20))))
     return lines
+
+
+class ReviewEngine:
+    """Spawn-safe stand-in; real process orchestration and classification are exercised."""
+    def __init__(self, dpi, device, *, cpu_threads=None):
+        self.cpu_threads = cpu_threads
+
+    def read(self, path):
+        path.with_suffix('.ocr').write_text(str(os.getpid()))
+        return parts_table() if path.stem == '1_10' else []
+
+
+def initialize_review_worker(dpi, device, model_lock):
+    ocr.initialize_worker(dpi, device, model_lock)
+    ocr.PaddleEngine = ReviewEngine
+
+
+def plain_ink(path, threshold=128, crop_percent=2):
+    return 5.0 if path.stem == '1_10' else .1
+
+
+def concurrent_ink(path, threshold=128, crop_percent=2):
+    event = {'pid': os.getpid(), 'start': time.monotonic(), 'threshold': threshold, 'crop': crop_percent}
+    path.with_suffix('.analysis_started').write_text(json.dumps(event))
+    if path.stem == 'crash':
+        os._exit(31)
+    if path.stem == 'analysis_fail':
+        raise RuntimeError('density failed')
+    if path.stem == 'change':
+        path.write_bytes(b'changed during image analysis')
+    pair = [path.parent / f'1_{page}.pdf' for page in (10, 11)]
+    if path in pair and all(candidate.exists() for candidate in pair):
+        other = pair[1] if path == pair[0] else pair[0]
+        deadline = time.monotonic() + 10
+        while not other.with_suffix('.analysis_started').exists():
+            if time.monotonic() > deadline:
+                raise RuntimeError('Other page analysis did not start concurrently')
+            time.sleep(.01)
+        if path == pair[0]:
+            time.sleep(.15)
+    event['end'] = time.monotonic()
+    path.with_suffix('.analysis_finished').write_text(json.dumps(event))
+    return plain_ink(path, threshold, crop_percent)
 
 
 class ReviewRulesTests(unittest.TestCase):
@@ -194,7 +241,7 @@ class ReviewRunTests(unittest.TestCase):
         with patch.object(ocr, 'discover_bdd', return_value=root/'BDD.xlsx'), \
              patch.object(review.classify, 'load_database', return_value=database()), \
              patch.object(ocr, 'PaddleEngine', side_effect=AssertionError('Must use cache')), \
-             patch.object(review, 'ink_percent', side_effect=lambda path, _threshold, _crop: .1 if path.stem in
+             patch.object(review, 'ink_percent', side_effect=lambda path, threshold, crop_percent: .1 if path.stem in
                           {'1_25', '1_26'} else 5):
             return review.run(args)
 
@@ -249,9 +296,11 @@ class ReviewRunTests(unittest.TestCase):
             self.assertEqual(len(list(source.glob('*.pdf'))), 4)
 
     def test_menu_command(self):
-        command = main.build_command('review_pages.py', Path('/Review'), output=Path('/out'), dry_run=True)
+        command = main.build_command('review_pages.py', Path('/Review'), workers=3,
+                                     output=Path('/out'), dry_run=True)
         self.assertIn('--dry-run', command)
         self.assertIn('--output', command)
+        self.assertEqual(command[command.index('-n') + 1], '3')
 
     def test_cache_miss_runs_ocr_once_and_reuses_raw_results_on_second_preview(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -284,6 +333,200 @@ class ReviewRunTests(unittest.TestCase):
             with results.open(encoding='utf-8-sig', newline='') as handle:
                 self.assertEqual(len(list(csv.DictReader(handle))), 4)
             self.assertIn('Status: FAILED', (results.parent/'report.txt').read_text())
+
+
+class ParallelReviewTests(unittest.TestCase):
+    def prepare(self, root, names=('1_10', '1_11', '1_12', '2_11'), *, cached=True):
+        source = root / 'Pending'
+        source.mkdir()
+        for name in names:
+            make_pdf(source / f'{name}.pdf', [name])
+        if cached:
+            cache = ocr.OcrCache(root / 'Reports' / '.ocr_cache.sqlite3', ocr.ocr_settings(200, 'cpu'))
+            for path in source.glob('*.pdf'):
+                cache.put(ocr.file_digest(path), parts_table() if path.stem == '1_10' else [])
+            cache.close()
+        return source
+
+    def execute(self, root, *flags, workers=2, analyzer=concurrent_ink, initializer=initialize_review_worker):
+        args = review.parse_args(['-d', str(root), '-n', str(workers), *flags])
+        with patch.object(ocr, 'discover_bdd', return_value=root / 'BDD.xlsx'), \
+                patch.object(review.classify, 'load_database', return_value=database()), \
+                patch.object(ocr, 'initialize_worker', initializer), \
+                patch.object(review, 'ink_percent', analyzer):
+            return review.run(args)
+
+    def rows(self, root):
+        report = max((root / 'Reports' / 'review').iterdir())
+        with (report / 'results.csv').open(encoding='utf-8-sig', newline='') as handle:
+            return report, list(csv.DictReader(handle))
+
+    def test_parallel_cached_analysis_finishes_out_of_order_but_decisions_match_sequential(self):
+        with tempfile.TemporaryDirectory() as directory:
+            roots = [Path(directory) / mode for mode in ('parallel', 'sequential')]
+            for root in roots:
+                root.mkdir()
+                self.prepare(root)
+            self.assertEqual(self.execute(roots[0], '--cache-only', initializer=initialize_broken_worker), 0)
+            self.assertEqual(self.execute(roots[1], '--cache-only', workers=1, analyzer=plain_ink), 0)
+            reports, rows = self.rows(roots[0])
+            _, sequential = self.rows(roots[1])
+            keys = (*review.classify.PAGE_HEADERS, 'Method', 'Predecessor', 'Ink_percent', 'Cache', 'Status', 'Error')
+            self.assertEqual([[row[key] for key in keys] for row in rows],
+                             [[row[key] for key in keys] for row in sequential])
+            self.assertEqual([row['Method'] for row in rows],
+                             ['TABLE_BADGE', 'PREVIOUS_PAGE', 'NO_INDEPENDENT_PREDECESSOR', 'NO_INDEPENDENT_PREDECESSOR'])
+            self.assertEqual(rows[1]['Predecessor'], '1_10')
+            events = [json.loads((roots[0] / 'Pending' / f'1_{i}.analysis_finished').read_text()) for i in (10, 11)]
+            self.assertNotEqual(events[0]['pid'], events[1]['pid'])
+            self.assertLess(max(event['start'] for event in events), min(event['end'] for event in events))
+            self.assertLess(events[1]['end'], events[0]['end'])
+            self.assertFalse(list((roots[0] / 'Pending').glob('*.ocr')))
+            self.assertIn('Workers: 2', (reports / 'report.txt').read_text())
+            self.assertTrue((reports / 'pages.xlsx').is_file())
+            settings = ocr.performance.options('review') | {'cache_only': True}
+            observation = ocr.performance.history(roots[0], 'review', settings)[0]
+            self.assertEqual((observation.workers, observation.cache_hits, observation.unresolved), (2, 4, 2))
+
+    def test_cache_misses_use_parallel_ocr_and_reuse_successful_raw_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.prepare(root, cached=False)
+            self.assertEqual(self.execute(root, '--dry-run'), 0)
+            self.assertEqual(len(list(source.glob('*.ocr'))), 4)
+            for marker in source.glob('*.ocr'):
+                marker.unlink()
+            self.assertEqual(self.execute(root, '--dry-run', '--cache-only', initializer=initialize_broken_worker), 0)
+            _, rows = self.rows(root)
+            self.assertTrue(all(row['Cache'] == 'HIT' for row in rows))
+            self.assertFalse(list(source.glob('*.ocr')))
+            self.assertEqual(len(list(source.glob('*.pdf'))), 4)
+            self.assertFalse((root / 'Reports' / 'review_assignments.jsonl').exists())
+
+    def test_cache_only_misses_do_not_start_models_or_render_pages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.prepare(root, cached=False)
+            with patch.object(ocr, 'ProcessPoolExecutor', side_effect=AssertionError('No work to submit')):
+                self.assertEqual(self.execute(root, '--cache-only'), 0)
+            _, rows = self.rows(root)
+            self.assertTrue(all(row['Method'] == 'CACHE_MISS' for row in rows))
+            self.assertFalse(list(source.glob('*.analysis_started')))
+
+    def test_copy_preserves_inputs_and_keeps_ordered_classification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.prepare(root)
+            before = {path.name: path.read_bytes() for path in source.glob('*.pdf')}
+            self.assertEqual(self.execute(root, '--copy', '--cache-only'), 0)
+            self.assertEqual(before, {path.name: path.read_bytes() for path in source.glob('*.pdf')})
+            self.assertTrue((root / 'Output' / VIS / '1_10.pdf').is_file())
+            self.assertTrue((root / 'Output' / VIS / '1_11.pdf').is_file())
+            self.assertTrue((root / 'Review' / '1_12.pdf').is_file())
+
+    def test_density_options_are_forwarded_to_workers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.prepare(root, ('1_10', '1_11'))
+            self.assertEqual(self.execute(root, '--cache-only', '--black-threshold', '96', '--crop-percent', '0'), 0)
+            for path in source.glob('*.analysis_finished'):
+                event = json.loads(path.read_text())
+                self.assertEqual((event['threshold'], event['crop']), (96, 0))
+
+    def test_model_initialization_failure_stops_without_publishing_pages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.prepare(root, ('1_10', '1_11'), cached=False)
+            with self.assertRaisesRegex(ocr.barcode.ConfigurationError, 'Cannot initialize.*model unavailable'):
+                self.execute(root, initializer=initialize_broken_worker)
+            self.assertEqual(len(list(source.glob('*.pdf'))), 2)
+            report, rows = self.rows(root)
+            self.assertEqual(rows, [])
+            self.assertIn('Status: FAILED', (report / 'report.txt').read_text())
+
+    def test_collision_retains_front_and_prevents_back_page_inheritance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.prepare(root, ('1_10', '1_11'))
+            output = root / 'Output' / VIS
+            output.mkdir(parents=True)
+            existing = output / '1_10.pdf'
+            make_pdf(existing, ['existing different front'])
+            before = existing.read_bytes()
+            self.assertEqual(self.execute(root, '--cache-only'), 1)
+            self.assertEqual(existing.read_bytes(), before)
+            self.assertTrue((source / '1_10.pdf').exists())
+            self.assertTrue((root / 'Review' / '1_11.pdf').exists())
+            _, rows = self.rows(root)
+            self.assertEqual([row['Status'] for row in rows], ['ERROR', 'REVIEW'])
+            self.assertEqual(rows[1]['Method'], 'NO_INDEPENDENT_PREDECESSOR')
+
+    def test_density_failure_retains_source_and_successful_ocr_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.prepare(root, ('analysis_fail', 'okay'), cached=False)
+            failed = source / 'analysis_fail.pdf'
+            digest = ocr.file_digest(failed)
+            self.assertEqual(self.execute(root), 1)
+            self.assertTrue(failed.is_file())
+            self.assertTrue((root / 'Review' / 'okay.pdf').is_file())
+            cache = ocr.OcrCache(root / 'Reports' / '.ocr_cache.sqlite3', ocr.ocr_settings(200, 'cpu'))
+            self.addCleanup(cache.close)
+            self.assertEqual(cache.get(digest), [])
+            self.assertEqual(self.execute(root, '--cache-only', workers=1, analyzer=plain_ink), 0)
+            self.assertFalse(failed.exists())
+
+    def test_changed_pdf_is_not_cached_or_published(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.prepare(root, ('change', 'okay'), cached=False)
+            digest = ocr.file_digest(source / 'change.pdf')
+            self.assertEqual(self.execute(root), 1)
+            self.assertTrue((source / 'change.pdf').is_file())
+            cache = ocr.OcrCache(root / 'Reports' / '.ocr_cache.sqlite3', ocr.ocr_settings(200, 'cpu'))
+            self.addCleanup(cache.close)
+            self.assertIsNone(cache.get(digest))
+            _, rows = self.rows(root)
+            self.assertIn('Source changed', rows[0]['Error'])
+
+    def test_worker_crash_stops_and_keeps_unpublished_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.prepare(root, ('crash', 'okay'))
+            with self.assertRaisesRegex(ocr.barcode.ConfigurationError, 'worker stopped unexpectedly'):
+                self.execute(root, '--cache-only')
+            self.assertEqual(len(list(source.glob('*.pdf'))), 2)
+            report, _ = self.rows(root)
+            self.assertIn('Status: FAILED', (report / 'report.txt').read_text())
+
+    def test_interruption_joins_workers_and_resume_keeps_predecessor_rules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.prepare(root, ('1_10', '1_11', '1_12'))
+            original_append = review.classify.append_lot_csv
+            def interrupt(*args):
+                original_append(*args)
+                raise KeyboardInterrupt
+            before = {child.pid for child in mp.active_children()}
+            with patch.object(review.classify, 'append_lot_csv', side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+                self.execute(root, '--cache-only')
+            self.assertEqual({child.pid for child in mp.active_children()}, before)
+            self.assertEqual(len(list(source.glob('*.analysis_started'))), 2)
+            self.assertTrue((root / 'Output' / VIS / '1_10.pdf').is_file())
+            report, rows = self.rows(root)
+            self.assertIn('Status: INTERRUPTED', (report / 'report.txt').read_text())
+            self.assertEqual([row['lot_page'] for row in rows], ['1_10'])
+            self.assertEqual(self.execute(root, '--cache-only', initializer=initialize_broken_worker), 0)
+            self.assertTrue((root / 'Output' / VIS / '1_11.pdf').is_file())
+            self.assertTrue((root / 'Review' / '1_12.pdf').is_file())
+
+    def test_worker_count_is_positive_and_defaults_to_one(self):
+        self.assertEqual(review.parse_args(['-d', '/root']).workers, 1)
+        for count in ('0', '-1', '1.5'):
+            with self.subTest(count=count), self.assertRaises(SystemExit):
+                review.parse_args(['-d', '/root', '-n', count])
+        with self.assertRaises(ValueError):
+            main.build_command('review_pages.py', Path('/root'), workers=0)
 
 
 if __name__ == '__main__':

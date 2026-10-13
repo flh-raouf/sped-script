@@ -80,6 +80,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual((config.search_list, config.database, config.ocr_seconds_per_page), ("dirty.xlsx", None, 2.0))
         self.assertEqual(config.already_done, ())
         self.assertEqual(config.ocr_workers, 1)
+        self.assertEqual(config.review_workers, 1)
 
     def test_ocr_worker_count_is_independent_and_positive(self):
         base = '[dossiers]\nsource = "/a"\nracine = "/b"\n[traitement]\nprocessus = 6\n'
@@ -88,6 +89,14 @@ class ConfigTests(unittest.TestCase):
         for value in ('0', '-1', 'true', '2.5', '"3"'):
             with self.subTest(value=value), self.assertRaisesRegex(PipelineError, 'processus_ocr'):
                 pipeline.load_config(self.write(base + f'processus_ocr = {value}\n'))
+
+    def test_final_stage_worker_count_is_independent_and_positive(self):
+        base = '[dossiers]\nsource = "/a"\nracine = "/b"\n[traitement]\nprocessus = 6\nprocessus_ocr = 3\n'
+        config = pipeline.load_config(self.write(base + 'processus_classification = 2\n'))
+        self.assertEqual((config.workers, config.ocr_workers, config.review_workers), (6, 3, 2))
+        for value in ('0', '-1', 'true', '2.5', '"3"'):
+            with self.subTest(value=value), self.assertRaisesRegex(PipelineError, 'processus_classification'):
+                pipeline.load_config(self.write(base + f'processus_classification = {value}\n'))
 
     def test_lots_processed_before_the_registry_are_declared_as_ranges(self):
         config = pipeline.load_config(self.write(

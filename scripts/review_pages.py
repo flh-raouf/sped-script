@@ -9,7 +9,9 @@ import os
 import re
 import sys
 import time
+from contextlib import closing
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 
 if __package__:
@@ -330,7 +332,7 @@ def run(args):
     classify.save_csv(reports / 'results.csv', HEADERS, [])
     cache = ocr.OcrCache((args.cache or paths.cache).expanduser(),
                          ocr.ocr_settings(args.dpi, args.device))
-    engine = None
+    workers = min(args.workers, len(files))
     recovered = errors = attempted = hits = 0
     def log(message):
         with (reports / 'processing.log').open('a', encoding='utf-8') as handle:
@@ -342,90 +344,87 @@ def run(args):
                 f'Dry run: {args.dry_run}\nProcessed: {attempted}/{len(files)}\n'
                 f'Recovered: {recovered}\nRemaining: {attempted-recovered}\nErrors: {errors}\n'
                 f'Cache hits: {hits}\nTotal duration: {elapsed:.3f} seconds\n')
+        text += f'Workers: {workers}\n'
         text += (f'Ink cutoff: {args.max_ink_percent}%\nCrop per edge: {args.crop_percent}%\n'
                  f'Black grayscale threshold: {args.black_threshold}\nDensity rendering: 100 DPI\n')
         barcode.atomic_text_write(reports / 'report.txt', lambda handle: handle.write(text))
-    log(f'Folder START | {source} | {len(files)} pages | dry-run={args.dry_run}')
+    log(f'Folder START | {source} | {len(files)} pages | workers={workers} | dry-run={args.dry_run}')
     try:
         summary('RUNNING')
         setup_seconds = time.perf_counter() - started
-        for path in files:
-            page_started = time.perf_counter()
-            decision = ocr.Decision(None, 'ERROR')
-            previous = error = ''
-            density = None
-            hit = False
-            row = (path.stem, '', '', '', '', '', '')
-            destination = path
-            try:
-                digest = ocr.file_digest(path)
-                lines = cache.get(digest)
-                hit = lines is not None
-                hits += hit
-                if lines is None and args.cache_only:
-                    decision = ocr.Decision(None, 'CACHE_MISS')
-                else:
-                    if lines is None:
-                        if engine is None:
-                            engine = ocr.PaddleEngine(args.dpi, args.device)
-                        lines = engine.read(path)
-                        if ocr.file_digest(path) != digest:
-                            raise RuntimeError('Source changed during OCR')
-                        cache.put(digest, lines)
-                    density = ink_percent(path, args.black_threshold, args.crop_percent)
-                    decision, previous = decide(path.stem, lines, density, lookup, predecessors,
-                                                args.max_ink_percent, args.min_score)
-                    row = ocr.enriched_row(path.stem, decision, lookup.database)
-                    if decision.reason == 'PREVIOUS_PAGE':
-                        previous_row = predecessors[(page_key(path.stem)[0], page_key(path.stem)[1]-1)][2]
-                        if previous_row and previous_row[3] == decision.vis:
-                            row = (path.stem, *previous_row[1:])
-                    if decision.vis:
-                        destination = output / decision.vis / path.name
-                        if not args.dry_run:
-                            with paths.provenance.open('a', encoding='utf-8') as journal:
-                                journal.write(json.dumps({'name': path.stem, 'method': decision.reason,
-                                                          'predecessor': previous, 'row': row,
-                                                          'source': str(path), 'destination': str(destination),
-                                                          'sha256': digest}) + '\n')
-                                journal.flush()
-                                os.fsync(journal.fileno())
-                            ocr.transfer_page(path, destination, digest, args.copy)
-                        recovered += 1
-                        if decision.reason == 'TABLE_BADGE':
-                            key = page_key(path.stem)
-                            if key:
-                                # Never replace an ambiguous or conflicting existing placement.
-                                value = (decision.vis, path.stem, row)
-                                existing = predecessors.get(key)
-                                predecessors[key] = (value if key not in predecessors
-                                                     or existing == value else None)
-                if not decision.vis:
-                    destination = paths.unresolved/path.name
-                    if not args.dry_run:
-                        ocr.transfer_page(path, destination, digest, args.copy)
-            except Exception as exc:  # noqa: BLE001 -- Retain failed pages and continue the batch.
-                errors += 1
-                error = f'{type(exc).__name__}: {exc}'
-                destination = path
+        analyze = partial(ink_percent, threshold=args.black_threshold, crop_percent=args.crop_percent)
+        with closing(ocr.read_pages(files, cache, args.dpi, args.device, workers,
+                                    cache_only=args.cache_only, analyze=analyze)) as pages:
+            for page in pages:
+                path = page.path
+                page_started = time.perf_counter()
+                decision = ocr.Decision(None, 'ERROR')
+                previous = error = ''
+                density = page.analysis
+                hit = page.cache_hit
                 row = (path.stem, '', '', '', '', '', '')
-            attempted += 1
-            elapsed = time.perf_counter() - page_started
-            classify.append_lot_csv(reports / 'results.csv', [(*row, decision.reason, previous,
-                                    '' if density is None else f'{density:.6f}', 'HIT' if hit else 'MISS',
-                                    'ERROR' if error else ('WOULD_CLASSIFY' if args.dry_run and decision.vis
-                                                         else 'CLASSIFIED' if decision.vis else 'REVIEW'),
-                                    f'{elapsed:.3f}', str(destination), error)])
-            log(f'{attempted}/{len(files)} | {path.name} | {error or decision.reason} | '
-                f'cache={"HIT" if hit else "MISS"} | duration={elapsed:.3f}s')
-            summary('RUNNING')
+                destination = path
+                hits += hit
+                try:
+                    if page.error is not None:
+                        raise page.error
+                    digest, lines = page.digest, page.lines
+                    if lines is None and args.cache_only:
+                        decision = ocr.Decision(None, 'CACHE_MISS')
+                    else:
+                        decision, previous = decide(path.stem, lines, density, lookup, predecessors,
+                                                    args.max_ink_percent, args.min_score)
+                        row = ocr.enriched_row(path.stem, decision, lookup.database)
+                        if decision.reason == 'PREVIOUS_PAGE':
+                            previous_row = predecessors[(page_key(path.stem)[0], page_key(path.stem)[1]-1)][2]
+                            if previous_row and previous_row[3] == decision.vis:
+                                row = (path.stem, *previous_row[1:])
+                        if decision.vis:
+                            destination = output / decision.vis / path.name
+                            if not args.dry_run:
+                                with paths.provenance.open('a', encoding='utf-8') as journal:
+                                    journal.write(json.dumps({'name': path.stem, 'method': decision.reason,
+                                                              'predecessor': previous, 'row': row,
+                                                              'source': str(path), 'destination': str(destination),
+                                                              'sha256': digest}) + '\n')
+                                    journal.flush()
+                                    os.fsync(journal.fileno())
+                                ocr.transfer_page(path, destination, digest, args.copy)
+                            recovered += 1
+                            if decision.reason == 'TABLE_BADGE':
+                                key = page_key(path.stem)
+                                if key:
+                                    # Never replace an ambiguous or conflicting existing placement.
+                                    value = (decision.vis, path.stem, row)
+                                    existing = predecessors.get(key)
+                                    predecessors[key] = (value if key not in predecessors
+                                                         or existing == value else None)
+                    if not decision.vis:
+                        destination = paths.unresolved/path.name
+                        if not args.dry_run:
+                            ocr.transfer_page(path, destination, digest, args.copy)
+                except Exception as exc:  # noqa: BLE001 -- Retain failed pages and continue the batch.
+                    errors += 1
+                    error = f'{type(exc).__name__}: {exc}'
+                    destination = path
+                    row = (path.stem, '', '', '', '', '', '')
+                attempted += 1
+                elapsed = page.seconds + time.perf_counter() - page_started
+                classify.append_lot_csv(reports / 'results.csv', [(*row, decision.reason, previous,
+                                        '' if density is None else f'{density:.6f}', 'HIT' if hit else 'MISS',
+                                        'ERROR' if error else ('WOULD_CLASSIFY' if args.dry_run and decision.vis
+                                                             else 'CLASSIFIED' if decision.vis else 'REVIEW'),
+                                        f'{elapsed:.3f}', str(destination), error)])
+                log(f'{attempted}/{len(files)} | {path.name} | {error or decision.reason} | '
+                    f'cache={"HIT" if hit else "MISS"} | duration={elapsed:.3f}s')
+                summary('RUNNING')
         with (reports / 'results.csv').open(encoding='utf-8-sig', newline='') as handle:
             reader = csv.reader(handle)
             next(reader)
             classify.write_page_workbook(reports / 'pages.xlsx', (tuple(row[:7]) for row in reader))
         summary('COMPLETED_WITH_ERRORS' if errors else 'COMPLETED')
         if not errors and not args.dry_run:
-            ocr.performance.record(reports, 'review', workers=1, pages=attempted,
+            ocr.performance.record(reports, 'review', workers=workers, pages=attempted,
                                    seconds=time.perf_counter() - started, setup_seconds=setup_seconds,
                                    cache_hits=hits, unresolved=attempted-recovered, args=args)
         log(f'Folder FINISHED | duration={time.perf_counter()-started:.3f}s | '
@@ -448,6 +447,8 @@ def parse_args(argv=None):
     parser.add_argument('--cache-only', action='store_true', help='Keep cache misses in Review; never run OCR')
     parser.add_argument('--dry-run', action='store_true', help='Write preview reports; do not move PDFs')
     parser.add_argument('--copy', action='store_true')
+    parser.add_argument('-n', '--workers', type=int, default=1,
+                        help='Page preparation processes; classification decisions stay ordered (default: 1)')
     parser.add_argument('--dpi', type=int, default=200)
     parser.add_argument('--device', default='cpu')
     parser.add_argument('--min-score', type=float, default=.9)
@@ -456,6 +457,8 @@ def parse_args(argv=None):
                         help='Percentage excluded from each edge for ink measurement only; 0 disables')
     parser.add_argument('--black-threshold', type=int, default=128)
     args = parser.parse_args(argv)
+    if args.workers <= 0:
+        parser.error('Workers must be greater than zero')
     if (args.dpi < 72 or not 0 <= args.min_score <= 1 or not 0 <= args.max_ink_percent <= 100
             or not 1 <= args.black_threshold <= 255 or not 0 <= args.crop_percent < 25):
         parser.error('Invalid DPI, confidence, ink percentage, grayscale threshold or crop (0 <= crop < 25)')

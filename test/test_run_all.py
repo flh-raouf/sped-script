@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import run_all
+import main
 from scripts import lot_picker, pipeline
 from test_pipeline import barcode_report, write_workbook
 from test_split_pages import make_pdf
@@ -69,8 +70,8 @@ class RunAllTests(unittest.TestCase):
         opened.assert_not_called()
         self.assertEqual(len(list((self.root / "Reports" / "pipeline").glob("*.txt"))), 1)
 
-    def test_stage_runner_uses_separate_barcode_and_ocr_worker_counts(self):
-        config = pipeline.Config(source=self.source, root=self.root, workers=6, ocr_workers=3)
+    def test_stage_runner_uses_separate_worker_counts_for_each_stage(self):
+        config = pipeline.Config(source=self.source, root=self.root, workers=6, ocr_workers=3, review_workers=2)
         with patch.object(run_all, 'execute_command', return_value=0) as execute:
             run_stage = run_all.make_stage_runner(config, self.root / 'BDD.xlsx', self.root / 'dirty list.xlsx')
             for stage in (pipeline.BARCODE_SCRIPT, pipeline.OCR_SCRIPT, pipeline.REVIEW_SCRIPT):
@@ -78,7 +79,16 @@ class RunAllTests(unittest.TestCase):
         barcode, ocr, review = [call.args[0] for call in execute.call_args_list]
         self.assertEqual(barcode[barcode.index('-n') + 1], '6')
         self.assertEqual(ocr[ocr.index('-n') + 1], '3')
-        self.assertNotIn('-n', review)
+        self.assertEqual(review[review.index('-n') + 1], '2')
+
+    def test_launcher_interrupt_waits_for_worker_cleanup(self):
+        command = main.build_command('review_pages.py', self.root, workers=2)
+        with patch.object(main.subprocess, 'Popen') as popen:
+            process = popen.return_value.__enter__.return_value
+            process.wait.side_effect = [KeyboardInterrupt, 130]
+            self.assertEqual(main.execute_command(command), 130)
+        process.kill.assert_not_called()
+        self.assertTrue(all(not call.kwargs for call in process.wait.call_args_list))
 
     def test_unattended_ocr_resume_uses_the_configured_worker_count(self):
         self.config.write_text(self.config.read_text() + 'processus_ocr = 3\n')
@@ -89,6 +99,16 @@ class RunAllTests(unittest.TestCase):
         command = self.commands[0]
         self.assertEqual(Path(command[2]).name, 'ocr_pages.py')
         self.assertEqual(command[command.index('-n') + 1], '3')
+
+    def test_unattended_final_stage_resume_uses_the_configured_worker_count(self):
+        self.config.write_text(self.config.read_text() + 'processus_classification = 2\n')
+        (self.root / 'Pending').mkdir()
+        (self.root / 'Pending' / '1_1.pdf').write_bytes(b'%PDF')
+        code, _, _ = self.launch('--yes')
+        self.assertEqual(code, 0)
+        command = self.commands[0]
+        self.assertEqual(Path(command[2]).name, 'review_pages.py')
+        self.assertEqual(command[command.index('-n') + 1], '2')
 
     def test_unattended_run_takes_every_new_lot(self):
         self.add_lots("1", "2", "3")

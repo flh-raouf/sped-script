@@ -13,6 +13,8 @@ racine = "/mnt/d/CAPTURESPED"
 processus = 6
 # Nombre de processus OCR (un modèle en mémoire par processus ; défaut : 1).
 processus_ocr = 2
+# Préparation de la classification finale (OCR et densité) ; décisions appliquées dans l'ordre.
+processus_classification = 2
 # Secondes pendant lesquelles la taille d'un lot doit rester stable avant import.
 # attente_stabilite = 5
 # Lots traités autrement que par ce raccourci (les lots des anciens rapports de
@@ -25,10 +27,11 @@ processus_ocr = 2
 
 # Bases indicatives tant qu'il n'existe pas de mesures comparables sur ce PC.
 # Les exécutions terminées alimentent ensuite Reports/*/<date>/performance.json.
-# Aucun gain proportionnel au nombre de processus n'est supposé.
+# La base OCR tient compte des processus et d'un surcoût, avant les mesures réelles.
 # [estimation]
 # codes_barres = 0.3   # secondes par page (débit réel, tous processus confondus)
-# ocr = 3.0            # secondes par page
+# ocr = 3.0            # secondes par page avec un seul processus
+# ocr_surcout_par_page = 0.2  # surcoût série par page en OCR parallèle ; base pour les pages en cache
 # part_ocr = 0.5       # part des pages qui passent par l'OCR
 # copie_mo_par_seconde = 30  # base de débit de copie (Mio/s), à adapter au disque/réseau
 # classification = 0.2      # base en secondes/page pour la classification finale

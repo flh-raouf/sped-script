@@ -56,10 +56,11 @@ Worker counts are configured independently in `config.toml`:
 [traitement]
 processus = 6      # barcode processes
 processus_ocr = 2  # OCR processes; defaults to 1 when omitted
+processus_classification = 2  # final-stage page preparation; defaults to 1
 ```
 
 The shortcut uses these values through `run_all.py`, including unattended runs
-and resumed OCR stages. Each OCR process loads its own model, so start with a
+and resumed stages. Each process that needs OCR loads its own model, so start with a
 small count and increase it according to available CPU cores and memory.
 
 The list shows every lot of the source folder, highest number first: new lots in
@@ -113,8 +114,14 @@ process shutdown time. Direct stage CLI commands record their internal elapsed
 time. Measurements from different hosts, CPU/memory configurations, package
 versions, implementations or relevant stage settings are kept separate.
 
-Worker counts use separate measured profiles: increasing them is never assumed
-to divide the duration proportionally. The estimator matches batch size, the
+Worker counts use separate measured profiles. Before an OCR profile exists,
+the default uses 3 seconds per uncached page, spread over the configured workers,
+plus 0.2 seconds per page for serial overhead. It rounds up to whole waves of
+pages: 10 uncached pages with 6 workers require two waves, so the initial OCR
+estimate is `2 × 3 + 10 × 0.2 = 8 seconds`. One worker keeps the existing
+3-second-per-page baseline; cached pages use only the overhead allowance.
+These allowances are configurable and are replaced by measured predictions
+as completed runs become available. The estimator matches batch size, the
 number and size of lots, average PDF size and cache-hit fraction. With enough
 comparable runs of different sizes, a robust fit learns the fixed startup cost;
 otherwise it uses observed setup and nearby run durations with wider bounds.
@@ -125,20 +132,20 @@ barcode lots themselves run sequentially, when those conditions occur in the
 calibration runs. It does not predict unrelated future machine load or failures.
 
 Copy time uses measured bytes and the configured source path. Final classification
-is included as a separate sequential stage, including an existing `Pending/`
-backlog. The proportions sent from barcode to OCR and from OCR to final
+is included as a separate stage with its own worker profile, including an existing
+`Pending/` backlog. Its measured cost includes parallel page preparation and
+ordered classification decisions. The proportions sent from barcode to OCR and from OCR to final
 classification are learned from completed reports. Existing OCR/Pending cache
 hits are checked read-only using at most 24 PDFs, 32 MiB and a two-second
 sampling budget checked between files (individual PDFs over 8 MiB are skipped). No model is loaded
 for the estimate, and the whole backlog is not hashed. Newly unresolved OCR
 pages are expected to use the raw OCR cache in final classification.
 
-The screen shows an indicative duration range, widened for sparse history,
-different lot shapes, sampled cache hits and varying routing proportions. It
-is not a guaranteed deadline or a statistical confidence interval for the
-whole job. A new worker count stays explicitly **À calibrer** until comparable
-measurements exist. The first-run baselines remain configurable under
-`[estimation]`: `codes_barres`, `ocr`, `part_ocr`, `copie_mo_par_seconde`
+The screen shows one line: `Durée estimée : environ …`. It starts with the
+configured baselines and adapts automatically as comparable completed runs
+are recorded. Calibration details and uncertainty bounds stay internal.
+The first-run baselines remain configurable under
+`[estimation]`: `codes_barres`, `ocr`, `ocr_surcout_par_page`, `part_ocr`, `copie_mo_par_seconde`
 (MiB/s; default 30) and `classification` (seconds/page; default 0.2). These are
 rough fallbacks, not measured performance claims; the fallback assumes all OCR
 pages may need final classification until the routing proportion is learned.
@@ -152,7 +159,7 @@ Select **Extraction des codes-barres**, **Extraction par OCR (PP-OCRv6 tiny)**,
 **Classification finale (tableaux de pièces et versos peu renseignés)**, or
 **Opérations complémentaires** with the arrow keys and Enter. The latter opens
 the hidden-file cleanup and PDF page-splitting options. Enter the root folder
-(the last folder is remembered for this session). Barcode extraction and OCR
+(the last folder is remembered for this session). All three classification stages
 ask for workers; barcode extraction also asks for the source workbook when
 needed. Cleaning defaults to a dry-run
 preview; choose deletion explicitly to remove files. Progress is displayed
@@ -419,8 +426,8 @@ Changing the worker count does not invalidate the shared OCR cache; a fully
 cached run does not start OCR workers. Ctrl+C stops new submissions, waits for
 active recognition calls to finish and leaves untransferred PDFs for retry.
 If a worker crashes, the stage stops with an error and retains untransferred
-sources. The final classification stage remains sequential because it can
-depend on the preceding page.
+sources. The final stage uses the same pool for page preparation and applies
+classification decisions in order because they can depend on the preceding page.
 
 Supply the parent root used for barcode classification. Only immediate PDFs
 inside its `OCR/` folder are processed, and each must contain exactly one page.
@@ -506,10 +513,28 @@ pages to the sibling final `Review/`. BDD discovery, tiny models and the OCR
 cache are shared with the OCR stage. Classification rules are unchanged.
 
 ```bash
-python scripts/review_pages.py -d "/path/to/Parent"
+python scripts/review_pages.py -d "/path/to/Parent" -n 3
 # Preview decisions using only existing OCR results:
 python scripts/review_pages.py -d "/path/to/Parent" --cache-only --dry-run
 ```
+
+`-n` / `--workers` selects a positive process count (default 1). The menu asks
+for this count, and `run_all.py` reads `processus_classification` from
+`[traitement]`. Workers run OCR on cache misses and measure ink density at 100
+DPI. Cached pages still get parallel density measurements without loading
+OCR models. `--cache-only` misses skip both OCR and density measurement.
+The pool and bounded input-order delivery are shared with the OCR stage.
+
+Only the parent applies classification rules, updates predecessor eligibility,
+saves cache entries, records provenance, transfers PDFs and writes reports.
+This preserves table-front/back-page dependencies even when preparation finishes
+out of order. An inherited page never becomes an independent predecessor.
+Successful raw OCR is saved even if density measurement fails; the failed page
+stays in `Pending/` for retry. PDFs changed during preparation are rejected.
+Interruptions stop new submissions and wait for active preparations to finish;
+a worker crash stops the stage and keeps unpublished sources. Dry-run and copy
+modes retain their existing behavior. Timing history records the final-stage
+worker count separately while the estimate stays on one line.
 
 The script first recognizes the parts-table layout: at least three aligned
 ten-digit part references paired with OK/NOK cells and a single badge in the

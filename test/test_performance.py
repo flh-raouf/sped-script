@@ -19,6 +19,18 @@ def run(stage='ocr', workers=2, pages=100, seconds=110, **values):
 
 
 class PredictionTests(unittest.TestCase):
+    def test_initial_ocr_estimate_accounts_for_workers_and_incomplete_waves(self):
+        self.assertEqual(perf.initial_ocr_seconds(10, 1, 3, .2), 30)
+        self.assertEqual(perf.initial_ocr_seconds(10, 6, 3, .2), 8)
+        self.assertEqual(perf.initial_ocr_seconds(12, 6, 3, .2), 8.4)
+        self.assertEqual(perf.initial_ocr_seconds(2, 6, 3, .2), 3.4)
+        self.assertEqual(perf.initial_ocr_seconds(0, 6, 3, .2), 0)
+
+    def test_initial_ocr_estimate_skips_recognition_for_cache_hits(self):
+        self.assertEqual(perf.initial_ocr_seconds(10, 6, 3, .2, hit_share=.5), 5)
+        self.assertEqual(perf.initial_ocr_seconds(10, 0, 3, .2, hit_share=1), 2)
+        self.assertEqual(perf.initial_ocr_seconds(10, 1, 3, .2, hit_share=.5), 16)
+
     def test_learns_saturation_from_actual_worker_profiles(self):
         samples = [run(workers=workers, pages=pages, seconds=20 + rate * pages, setup_seconds=5)
                    for workers, rate in ((1, 4), (2, 2.5), (4, 2.3), (8, 3))
@@ -29,7 +41,7 @@ class PredictionTests(unittest.TestCase):
         self.assertLess(predictions[2].seconds, predictions[1].seconds)
         self.assertGreater(predictions[8].seconds, predictions[4].seconds)
         self.assertTrue(all(cost.calibrated for cost in predictions.values()))
-        # An unobserved worker count is explicitly uncalibrated, not interpolated as 1/N.
+        # Missing profiles use the supplied fallback rather than extrapolating measurements.
         unseen = perf.predict(samples, pages=300, workers=3, fallback=4)
         self.assertFalse(unseen.calibrated)
         self.assertEqual(unseen.seconds, 1200)
@@ -199,18 +211,44 @@ class PipelineEstimateTests(HistoryFixture, unittest.TestCase):
         config = pipeline.Config(source=self.root, root=self.root)
         estimate = perf.estimate(pipeline.Plan(pending_files=300), config, lambda path: [])
         self.assertEqual(estimate.seconds, 60)
-        self.assertTrue(any('séquentielle' in note for note in estimate.notes))
+        self.assertTrue(any('classification finale' in note for note in estimate.notes))
 
-    def test_uncalibrated_parallelism_is_explicit_in_the_display(self):
+    def test_final_stage_estimate_uses_its_own_worker_profile(self):
+        config = pipeline.Config(source=self.root, root=self.root, review_workers=3)
+        runs = [run(stage='review', workers=workers, pages=pages, seconds=2 + pages * rate)
+                for workers, rate in ((1, .4), (3, .2)) for pages in (100, 200, 400)]
+        with patch.object(perf, 'history', side_effect=lambda root, stage, settings=None: runs if stage == 'review' else []):
+            estimate = perf.estimate(pipeline.Plan(pending_files=200), config, lambda path: [])
+        self.assertEqual(estimate.seconds, 42)
+
+    def test_duration_display_stays_on_one_line(self):
         config = pipeline.Config(source=self.root, root=self.root, ocr_workers=6)
         text = pipeline.format_plan(pipeline.Plan(ocr_files=10), config)
-        self.assertIn('OCR (6 processus)', text)
-        self.assertIn('À calibrer', text)
-        self.assertIn('fourchette indicative', text)
+        self.assertEqual(text.splitlines()[-1], 'Durée estimée : environ 10 s.')
+        self.assertEqual(len(text.splitlines()), 4)
+
+    def test_first_pipeline_estimate_uses_parallel_ocr_then_adapts_to_measurements(self):
+        config = pipeline.Config(source=self.root, root=self.root, ocr_workers=6)
+        plan = pipeline.Plan(ocr_files=10)
+        self.assertEqual(perf.estimate(plan, config, lambda path: []).seconds, 10)  # 8 OCR + 2 final stage
+        directory = self.root / 'Reports' / 'ocr' / '01'
+        directory.mkdir(parents=True)
+        perf.record(directory, 'ocr', workers=6, pages=10, seconds=12, setup_seconds=2, unresolved=10)
+        self.assertEqual(perf.estimate(plan, config, lambda path: []).seconds, 14)  # measured 12 OCR + 2 final
 
     def test_estimation_config_rejects_nonfinite_rates_and_invalid_shares(self):
-        for key, value in [('ocr', 'nan'), ('ocr', 'inf'), ('part_ocr', '1.1'), ('copie_mo_par_seconde', '0')]:
+        for key, value in [('ocr', 'nan'), ('ocr', 'inf'), ('part_ocr', '1.1'), ('copie_mo_par_seconde', '0'),
+                           ('ocr_surcout_par_page', '-0.1'), ('ocr_surcout_par_page', 'nan')]:
             config = self.root / 'config.toml'
             config.write_text(f'[dossiers]\nsource = "/a"\nracine = "/b"\n[estimation]\n{key} = {value}\n')
             with self.subTest(key=key, value=value), self.assertRaises(pipeline.PipelineError):
                 pipeline.load_config(config)
+
+    def test_ocr_overhead_baseline_can_be_configured(self):
+        path = self.root / 'config.toml'
+        path.write_text(f'[dossiers]\nsource = "{self.root}"\nracine = "{self.root}"\n'
+                        '[traitement]\nprocessus_ocr = 6\n'
+                        '[estimation]\nocr = 3.5\nocr_surcout_par_page = 0.3\n')
+        config = pipeline.load_config(path)
+        self.assertEqual(config.ocr_overhead_seconds_per_page, .3)
+        self.assertEqual(perf.estimate(pipeline.Plan(ocr_files=10), config, lambda path: []).seconds, 12)

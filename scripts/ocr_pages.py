@@ -19,11 +19,11 @@ import tempfile
 import time
 import unicodedata
 from collections import defaultdict, deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import closing
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -187,19 +187,40 @@ def initialize_worker(dpi, device, model_lock):
     _model_lock = model_lock
 
 
-def recognize_page(path: Path) -> tuple[list[TextLine] | None, float, Exception | None]:
+@dataclass(frozen=True)
+class PreparedPage:
+    lines: list[TextLine] | None
+    seconds: float
+    error: Exception | None = None
+    analysis: float | None = None
+
+
+def prepare_page(path: Path, lines: list[TextLine] | None,
+                 read: Callable[[Path], list[TextLine]] | None = None,
+                 analyze: Callable[[Path], float] | None = None) -> PreparedPage:
+    started = time.perf_counter()
+    error = analysis = None
+    try:
+        if lines is None and read is not None:
+            lines = read(path)
+        if lines is not None and analyze is not None:
+            analysis = analyze(path)
+    except Exception as exc:
+        error = exc
+    return PreparedPage(lines, time.perf_counter() - started, error, analysis)
+
+
+def recognize_page(path: Path, lines: list[TextLine] | None = None, *,
+                   cache_only: bool = False, analyze: Callable[[Path], float] | None = None) -> PreparedPage:
     global _worker_engine
     started = time.perf_counter()
-    if _worker_engine is None:
+    needs_ocr = lines is None and not cache_only
+    if needs_ocr and _worker_engine is None:
         # Avoid simultaneous downloads into Paddle's shared model directory.
         with _model_lock:
             _worker_engine = create_engine(*_worker_options, cpu_threads=1)
-    lines = error = None
-    try:
-        lines = _worker_engine.read(path)
-    except Exception as exc:
-        error = exc
-    return lines, time.perf_counter() - started, error
+    result = prepare_page(path, lines, _worker_engine.read if needs_ocr else None, analyze)
+    return replace(result, seconds=time.perf_counter() - started)
 
 
 @dataclass
@@ -211,9 +232,11 @@ class OcrPage:
     seconds: float = 0.0
     error: Exception | None = None
     input_bytes: int = 0
+    analysis: float | None = None
 
 
-def read_pages(files: list[Path], cache: OcrCache, dpi: int, device: str, workers: int) -> Iterator[OcrPage]:
+def read_pages(files: list[Path], cache: OcrCache, dpi: int, device: str, workers: int, *,
+               cache_only: bool = False, analyze: Callable[[Path], float] | None = None) -> Iterator[OcrPage]:
     """Bound the in-flight pages and publish in input order; only the parent writes cache."""
     pending = deque()
     remaining = iter(files)
@@ -234,13 +257,16 @@ def read_pages(files: list[Path], cache: OcrCache, dpi: int, device: str, worker
                     page.digest = file_digest(path)
                     page.lines = cache.get(page.digest)
                     page.cache_hit = page.lines is not None
-                    if not page.cache_hit and workers > 1:
+                    needs_ocr = not page.cache_hit and not cache_only
+                    needs_analysis = analyze is not None and (page.cache_hit or needs_ocr)
+                    if (needs_ocr or needs_analysis) and workers > 1:
                         if pool is None:
                             context = mp.get_context('spawn')
                             pool = ProcessPoolExecutor(
                                 max_workers=workers, mp_context=context,
                                 initializer=initialize_worker, initargs=(dpi, device, context.Lock()))
-                        task = pool.submit(recognize_page, path)
+                        task = pool.submit(recognize_page, path, page.lines,
+                                           cache_only=cache_only, analyze=analyze)
                 except BrokenProcessPool:
                     raise
                 except Exception as exc:
@@ -251,25 +277,28 @@ def read_pages(files: list[Path], cache: OcrCache, dpi: int, device: str, worker
             if not pending:
                 break
             page, task = pending.popleft()
-            if page.error is None and not page.cache_hit:
+            if page.error is None:
                 try:
                     if task is not None:
-                        page.lines, seconds, page.error = task.result()
-                        page.seconds += seconds
+                        result = task.result()
                     else:
                         started = time.perf_counter()
-                        if engine is None:
+                        needs_ocr = not page.cache_hit and not cache_only
+                        if needs_ocr and engine is None:
                             engine = create_engine(dpi, device)
-                        try:
-                            page.lines = engine.read(page.path)
-                        finally:
-                            page.seconds += time.perf_counter() - started
-                    if page.error is None:
+                        result = prepare_page(page.path, page.lines,
+                                              engine.read if needs_ocr else None, analyze)
+                        result = replace(result, seconds=time.perf_counter() - started)
+                    page.lines, page.error, page.analysis = result.lines, result.error, result.analysis
+                    page.seconds += result.seconds
+                    # Successful raw OCR stays useful even when image analysis fails.
+                    if page.lines is not None and (not page.cache_hit or analyze is not None):
                         started = time.perf_counter()
                         try:
                             if file_digest(page.path) != page.digest:
-                                raise RuntimeError('Source changed during OCR; no cache entry saved')
-                            cache.put(page.digest, page.lines)
+                                raise RuntimeError('Source changed during processing; no cache entry saved')
+                            if not page.cache_hit:
+                                cache.put(page.digest, page.lines)
                         finally:
                             page.seconds += time.perf_counter() - started
                 except (barcode.ConfigurationError, BrokenProcessPool):
@@ -278,7 +307,7 @@ def read_pages(files: list[Path], cache: OcrCache, dpi: int, device: str, worker
                     page.error = exc
             yield page
     except BrokenProcessPool as exc:
-        raise barcode.ConfigurationError('An OCR worker stopped unexpectedly; untransferred source '
+        raise barcode.ConfigurationError('A page worker stopped unexpectedly; untransferred source '
                                          'PDFs were retained. Check available memory before retrying.') from exc
     finally:
         if pool is not None:

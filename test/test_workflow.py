@@ -74,7 +74,7 @@ class ParentWorkflowTests(unittest.TestCase):
             self.assertFalse((root/'Review').exists())
 
             with patch.object(ocr, 'PaddleEngine', side_effect=AssertionError('Use shared OCR cache')), \
-                 patch.object(review, 'ink_percent', side_effect=lambda path, *_: .1 if path.stem == '1_3' else 5):
+                 patch.object(review, 'ink_percent', side_effect=lambda path, **_: .1 if path.stem == '1_3' else 5):
                 self.assertEqual(review.run(review.parse_args(['-d', str(root), '--cache-only'])), 0)
             self.assertEqual(len(list((root/'Pending').glob('*.pdf'))), 0)
             self.assertEqual(len(list((root/'Output'/VIS).glob('*.pdf'))), 4)

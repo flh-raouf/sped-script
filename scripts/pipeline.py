@@ -64,12 +64,14 @@ class Config:
     search_list: str | None = None
     stable_seconds: float = 5.0
     barcode_seconds_per_page: float = 0.3   # measured throughput, all processes together
-    ocr_seconds_per_page: float = 3.0
+    ocr_seconds_per_page: float = 3.0   # initial baseline with one OCR worker
     ocr_share: float = 0.5
     already_done: Ranges = ()   # lots processed before this tool kept a registry
     ocr_workers: int = 1
     copy_megabytes_per_second: float = 30.0
     review_seconds_per_page: float = .2
+    ocr_overhead_seconds_per_page: float = .2
+    review_workers: int = 1
 
 
 def load_config(path: Path) -> Config:
@@ -85,12 +87,13 @@ def load_config(path: Path) -> Config:
     for key in ("source", "racine"):
         if not isinstance(folders.get(key), str) or not folders[key].strip():
             raise PipelineError(f"config.toml : [dossiers] {key} est obligatoire.")
-    workers = processing.get("processus", Config.workers)
-    if not isinstance(workers, int) or isinstance(workers, bool) or workers <= 0:
-        raise PipelineError("config.toml : [traitement] processus doit être un entier supérieur à zéro.")
-    ocr_workers = processing.get("processus_ocr", Config.ocr_workers)
-    if not isinstance(ocr_workers, int) or isinstance(ocr_workers, bool) or ocr_workers <= 0:
-        raise PipelineError("config.toml : [traitement] processus_ocr doit être un entier supérieur à zéro.")
+    worker_counts = {}
+    for key, field_name in {'processus': 'workers', 'processus_ocr': 'ocr_workers',
+                            'processus_classification': 'review_workers'}.items():
+        value = processing.get(key, getattr(Config, field_name))
+        if type(value) is not int or value <= 0:
+            raise PipelineError(f"config.toml : [traitement] {key} doit être un entier supérieur à zéro.")
+        worker_counts[field_name] = value
     numbers = {
         "stable_seconds": processing.get("attente_stabilite", Config.stable_seconds),
         "barcode_seconds_per_page": estimate.get("codes_barres", Config.barcode_seconds_per_page),
@@ -98,6 +101,7 @@ def load_config(path: Path) -> Config:
         "ocr_share": estimate.get("part_ocr", Config.ocr_share),
         "copy_megabytes_per_second": estimate.get("copie_mo_par_seconde", Config.copy_megabytes_per_second),
         "review_seconds_per_page": estimate.get("classification", Config.review_seconds_per_page),
+        "ocr_overhead_seconds_per_page": estimate.get("ocr_surcout_par_page", Config.ocr_overhead_seconds_per_page),
     }
     for name, value in numbers.items():
         if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
@@ -113,7 +117,7 @@ def load_config(path: Path) -> Config:
         raise PipelineError(f"config.toml : [traitement] deja_traites : {exc}.") from exc
     return Config(
         source=Path(folders["source"]).expanduser(), root=Path(folders["racine"]).expanduser(),
-        workers=workers, ocr_workers=ocr_workers,
+        **worker_counts,
         database=processing.get("bdd"), search_list=processing.get("liste"),
         already_done=already_done, **{name: float(value) for name, value in numbers.items()})
 
@@ -463,12 +467,7 @@ def format_plan(plan: Plan, config: Config) -> str:
         lines.append(f"Ignoré : lot {name} ({reason}).")
     if not plan.idle:
         estimate = performance.estimate(plan, config, pdf_files)
-        lines.append(f"Durée estimée : environ {format_estimate(estimate.seconds)} "
-                     f"(fourchette indicative : {format_estimate(estimate.low)} à {format_estimate(estimate.high)}).")
-        if estimate.notes:
-            lines.append('À calibrer : ' + ' ; '.join(estimate.notes) + '.')
-        else:
-            lines.append('Estimation basée sur les exécutions comparables de ce PC, aux mêmes nombres de processus.')
+        lines.append(f"Durée estimée : environ {format_estimate(estimate.seconds)}.")
     return "\n".join(lines)
 
 
